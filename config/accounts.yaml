@@ -1,0 +1,5 @@
+# Example configuration only. Replace with your own account locally.
+accounts:
+  - name: 示例公众号
+    wxid: replace_with_wechat_id
+    enabled: false

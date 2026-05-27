@@ -1,0 +1,38 @@
+source: justone
+timezone: Asia/Shanghai
+daily_run_time: "12:00"
+lookback_hours: 24
+send_empty_report: true
+missed_run_policy: run_on_next_startup
+summary_style: concise_daily
+overview_mode: factual
+report_title: "微信公众号每日摘要"
+email_subject_prefix: "微信公众号每日摘要"
+
+# Official Just One API docs list this as prod-cn, optional for Mainland China.
+# Switch back to https://api.justoneapi.com if your network can validate that certificate.
+justone_base_url: "http://47.117.133.51:30015"
+source_timeout_seconds: 60
+source_retries: 2
+wordpress_per_page: 30
+wordpress_timeout_seconds: 60
+rss_timeout_seconds: 60
+article_library_timeout_seconds: 60
+max_articles_per_account: 0
+max_total_articles: 0
+summary_mode: individual
+llm_parallel_workers: 3
+llm_batch_size: 3
+llm_batch_article_chars: 1800
+
+llm_timeout_seconds: 120
+llm_retries: 2
+llm_max_input_chars_per_article: 12000
+llm_temperature: 0.2
+llm_max_tokens: 1200
+
+state_path: data/state.sqlite3
+lock_path: data/run.lock
+log_dir: logs
+reports_dir: reports
+include_raw_errors: true

@@ -1,0 +1,1 @@
+"""WeChat daily digest automation."""
