@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import logging
+import os
 import re
 import sys
 from datetime import date, datetime
@@ -51,6 +52,7 @@ def main(argv: list[str] | None = None) -> int:
 
     load_dotenv(PROJECT_ROOT / ".env")
     settings = load_settings(PROJECT_ROOT)
+    configure_proxy_environment(settings)
     setup_logging(PROJECT_ROOT, settings)
 
     try:
@@ -86,6 +88,24 @@ def setup_logging(project_root: Path, settings: dict[str, Any]) -> None:
             logging.StreamHandler(sys.stdout),
         ],
     )
+
+
+def configure_proxy_environment(settings: dict[str, Any]) -> None:
+    if not bool(settings.get("ignore_env_proxy", True)):
+        return
+    proxy_keys = (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    )
+    removed = [key for key in proxy_keys if key in os.environ]
+    for key in removed:
+        os.environ.pop(key, None)
+    if removed:
+        logging.getLogger(__name__).debug("Ignored proxy environment variables: %s", ", ".join(removed))
 
 
 def parse_schedule_date(value: str | None, settings: dict[str, Any]) -> date:
@@ -150,6 +170,7 @@ def _generate_report(
     logging.info("Generating report for %s with %d enabled accounts", schedule_date.isoformat(), len(accounts))
 
     issues: list[RunIssue] = []
+    list_failures = 0
     metas: list[ArticleMeta] = []
     source = make_source(settings) if accounts else None
     for account in accounts:
@@ -159,8 +180,12 @@ def _generate_report(
             logging.info("Fetched %d posts for %s", len(account_posts), account.name)
             metas.extend(account_posts)
         except Exception as exc:
+            list_failures += 1
             logging.warning("Failed to list posts for %s: %s", account.name, exc)
             issues.append(RunIssue(scope="list_posts", account_name=account.name, account_wxid=account.wxid, message=str(exc)))
+
+    if accounts and list_failures == len(accounts) and not metas:
+        raise RuntimeError("All configured sources failed before any article was collected; not sending an empty success report.")
 
     original_count = len(metas)
     metas = limit_articles(dedupe_articles(metas), settings)

@@ -20,6 +20,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "send_empty_report": True,
     "missed_run_policy": "run_on_next_startup",
     "summary_style": "concise_daily",
+    "ignore_env_proxy": False,
     "overview_mode": "factual",
     "report_title": "微信公众号每日摘要",
     "email_subject_prefix": "微信公众号每日摘要",
