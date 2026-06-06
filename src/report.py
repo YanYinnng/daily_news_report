@@ -1,11 +1,25 @@
 from __future__ import annotations
 
 import html
+import re
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
 from .models import ArticleDigest, RunIssue
+
+
+REPORT_CSS = (
+    "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;line-height:1.65;color:#1f2937;max-width:860px;margin:0 auto;padding:24px;background:#f8fafc}"
+    "main{background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:24px}"
+    "h1{font-size:32px;line-height:1.2;margin:0 0 14px;font-weight:800} h2{font-size:24px;line-height:1.28;margin:36px 0 16px;border-bottom:1px solid #e5e7eb;padding-bottom:10px;font-weight:800}"
+    "h3{font-size:21px;line-height:1.34;margin:30px 0 14px;font-weight:800} h4{font-size:19px;line-height:1.42;margin:26px 0 10px;font-weight:800}.meta{color:#6b7280;font-size:13px} a{color:#2563eb}"
+    ".summary-card{background:#f9fafb;border:1px solid #e5e7eb;border-radius:6px;padding:12px;margin:8px 0 18px}"
+    ".summary-card p{margin:0 0 10px}.summary-card p:last-child{margin-bottom:0}.summary-card ul{margin:8px 0 0 20px;padding:0}.summary-card li{margin:6px 0}.summary-card strong{color:#111827;font-weight:700}"
+    ".account-overview{background:#f8fafc;border-left:3px solid #94a3b8;padding:10px 12px;margin:8px 0 16px}"
+    ".article-images{display:flex;gap:10px;flex-wrap:wrap;margin:10px 0 18px}.article-images img{max-width:260px;max-height:180px;border-radius:6px;border:1px solid #e5e7eb;object-fit:cover}"
+    ".issue{color:#991b1b}"
+)
 
 
 def build_markdown(
@@ -16,11 +30,13 @@ def build_markdown(
     digests: list[ArticleDigest],
     issues: list[RunIssue],
     settings: dict[str, Any],
+    theme_name: str | None = None,
 ) -> str:
     title = str(settings.get("report_title", "微信公众号每日摘要"))
     lines = [
-        f"# {title} - {schedule_date.isoformat()}",
+        f"# {title}{f' · {theme_name}' if theme_name else ''} - {schedule_date.isoformat()}",
         "",
+        *([f"- 主题：{theme_name}"] if theme_name else []),
         f"- 汇总窗口：{since.strftime('%Y-%m-%d %H:%M')} 至 {until.strftime('%Y-%m-%d %H:%M')}",
         f"- 新文章数：{len(digests)}",
         "",
@@ -32,6 +48,7 @@ def build_markdown(
 
     grouped = group_digests_by_account(digests)
     if grouped:
+        remaining_images = int(settings.get("max_total_images_per_theme", 20) or 0)
         lines.extend(["## 各公众号概览", ""])
         for account_name, items in grouped:
             titles = "；".join(item.meta.title for item in items[:3])
@@ -62,6 +79,13 @@ def build_markdown(
                         "",
                     ]
                 )
+                image_urls = article_image_urls(digest, settings, remaining_images)
+                if image_urls:
+                    lines.append("图片：")
+                    for image_url in image_urls:
+                        lines.append(f"![]({image_url})")
+                    lines.append("")
+                    remaining_images -= len(image_urls)
                 article_index += 1
     else:
         lines.extend(["## 按公众号摘要", "", "过去 24 小时内没有发现新的文章。", ""])
@@ -120,25 +144,23 @@ def build_html(
     digests: list[ArticleDigest],
     issues: list[RunIssue],
     settings: dict[str, Any],
+    theme_name: str | None = None,
 ) -> str:
     title = html.escape(str(settings.get("report_title", "微信公众号每日摘要")))
+    display_title = f"{title}{f' · {html.escape(theme_name)}' if theme_name else ''}"
     body: list[str] = [
         "<!doctype html>",
         "<html>",
         "<head>",
         '<meta charset="utf-8">',
-        f"<title>{title} - {schedule_date.isoformat()}</title>",
+        f"<title>{display_title} - {schedule_date.isoformat()}</title>",
         "<style>",
-        "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;line-height:1.65;color:#1f2937;max-width:860px;margin:0 auto;padding:24px;background:#f8fafc}",
-        "main{background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:24px}",
-        "h1{font-size:24px;margin:0 0 12px} h2{font-size:18px;margin-top:28px;border-bottom:1px solid #e5e7eb;padding-bottom:6px}",
-        "h3{font-size:16px;margin-top:22px} h4{font-size:15px;margin:18px 0 6px}.meta{color:#6b7280;font-size:13px} a{color:#2563eb} pre{white-space:pre-wrap;font-family:inherit;background:#f9fafb;border:1px solid #e5e7eb;border-radius:6px;padding:12px}",
-        ".account-overview{background:#f8fafc;border-left:3px solid #94a3b8;padding:10px 12px;margin:8px 0 16px}",
-        ".issue{color:#991b1b}",
+        REPORT_CSS,
         "</style>",
         "</head>",
         "<body><main>",
-        f"<h1>{title} - {schedule_date.isoformat()}</h1>",
+        f"<h1>{display_title} - {schedule_date.isoformat()}</h1>",
+        *([f"<p class='meta'>主题：{html.escape(theme_name)}</p>"] if theme_name else []),
         f"<p class='meta'>汇总窗口：{html.escape(since.strftime('%Y-%m-%d %H:%M'))} 至 {html.escape(until.strftime('%Y-%m-%d %H:%M'))}；新文章数：{len(digests)}</p>",
         "<h2>总览</h2>",
         f"<p>{_paragraphs(overview.strip() or '过去 24 小时内没有发现新的文章。')}</p>",
@@ -146,6 +168,7 @@ def build_html(
 
     grouped = group_digests_by_account(digests)
     if grouped:
+        remaining_images = int(settings.get("max_total_images_per_theme", 20) or 0)
         body.append("<h2>各公众号概览</h2><ul>")
         for account_name, items in grouped:
             titles = "；".join(item.meta.title for item in items[:3])
@@ -169,9 +192,16 @@ def build_html(
                     [
                         f"<h4>{article_index}. {html.escape(digest.meta.title)}</h4>",
                         f"<p class='meta'>发布时间：{html.escape(published)}；<a href='{html.escape(digest.meta.url)}'>原文链接</a></p>",
-                        f"<pre>{html.escape(digest.summary.strip())}</pre>",
+                        summary_to_html(digest.summary.strip()),
                     ]
                 )
+                image_urls = article_image_urls(digest, settings, remaining_images)
+                if image_urls:
+                    body.append("<div class='article-images'>")
+                    for image_url in image_urls:
+                        body.append(f"<img src='{html.escape(image_url)}' alt='article image'>")
+                    body.append("</div>")
+                    remaining_images -= len(image_urls)
                 article_index += 1
     else:
         body.append("<h2>按公众号摘要</h2>")
@@ -194,10 +224,17 @@ def write_reports(
     schedule_date: date,
     markdown: str,
     html_text: str,
+    theme_id: str | None = None,
 ) -> tuple[Path, Path]:
     reports_dir.mkdir(parents=True, exist_ok=True)
-    markdown_path = reports_dir / f"{schedule_date.isoformat()}.md"
-    html_path = reports_dir / f"{schedule_date.isoformat()}.html"
+    if theme_id:
+        date_dir = reports_dir / schedule_date.isoformat()
+        date_dir.mkdir(parents=True, exist_ok=True)
+        markdown_path = date_dir / f"{theme_id}.md"
+        html_path = date_dir / f"{theme_id}.html"
+    else:
+        markdown_path = reports_dir / f"{schedule_date.isoformat()}.md"
+        html_path = reports_dir / f"{schedule_date.isoformat()}.html"
     markdown_path.write_text(markdown, encoding="utf-8")
     html_path.write_text(html_text, encoding="utf-8")
     return markdown_path, html_path
@@ -206,3 +243,69 @@ def write_reports(
 def _paragraphs(text: str) -> str:
     parts = [html.escape(part.strip()) for part in text.splitlines() if part.strip()]
     return "<br>".join(parts)
+
+
+def summary_to_html(text: str) -> str:
+    lines = text.splitlines()
+    html_parts: list[str] = ['<div class="summary-card">']
+    paragraph: list[str] = []
+    list_open = False
+
+    def flush_paragraph() -> None:
+        nonlocal paragraph
+        if paragraph:
+            html_parts.append(f"<p>{'<br>'.join(paragraph)}</p>")
+            paragraph = []
+
+    def close_list() -> None:
+        nonlocal list_open
+        if list_open:
+            html_parts.append("</ul>")
+            list_open = False
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            flush_paragraph()
+            close_list()
+            continue
+
+        bullet_match = re.match(r"^[-*•]\s+(.+)$", line)
+        if bullet_match:
+            flush_paragraph()
+            if not list_open:
+                html_parts.append("<ul>")
+                list_open = True
+            html_parts.append(f"<li>{inline_markdown_to_html(bullet_match.group(1))}</li>")
+            continue
+
+        close_list()
+        paragraph.append(inline_markdown_to_html(line))
+
+    flush_paragraph()
+    close_list()
+    html_parts.append("</div>")
+    return "".join(html_parts)
+
+
+def inline_markdown_to_html(text: str) -> str:
+    rendered = html.escape(text)
+    return re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", rendered)
+
+
+def article_image_urls(digest: ArticleDigest, settings: dict[str, Any], remaining: int) -> list[str]:
+    include_images = str(settings.get("include_images", "auto")).lower()
+    if include_images in {"false", "no", "off", "0"} or remaining <= 0:
+        return []
+    limit = max(0, int(settings.get("max_images_per_article", 2) or 0))
+    if limit <= 0:
+        return []
+    urls: list[str] = []
+    for url in digest.content.image_urls:
+        if not url.startswith(("http://", "https://")):
+            continue
+        if url not in urls:
+            urls.append(url)
+        if len(urls) >= min(limit, remaining):
+            break
+    return urls

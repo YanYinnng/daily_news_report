@@ -6,7 +6,7 @@ from urllib.parse import urlencode, urlparse
 
 import requests
 
-from ..html_utils import html_to_text
+from ..html_utils import extract_image_urls, html_to_text
 from ..models import Account, ArticleContent, ArticleMeta
 from ..timeutils import parse_datetime_value
 
@@ -38,7 +38,12 @@ class ArticleLibrarySource:
             return cached
         response = requests.get(article_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=self.timeout_seconds)
         response.raise_for_status()
-        page_content = ArticleContent(url=article_url, text=html_to_text(response.text), raw={"source": "article-library-page"})
+        page_content = ArticleContent(
+            url=article_url,
+            text=html_to_text(response.text),
+            image_urls=extract_image_urls(response.text),
+            raw={"source": "article-library-page"},
+        )
         if cached:
             page_content.title = cached.title
             page_content.author = cached.author
@@ -88,6 +93,7 @@ class ArticleLibrarySource:
             author=str(item.get("author") or account.name),
             published_at=published_at,
             text=content,
+            image_urls=extract_image_urls(content),
             raw={"source": "article-library", **item},
         )
         return ArticleMeta(

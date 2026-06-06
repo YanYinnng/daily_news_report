@@ -2,6 +2,16 @@
 .venv/
 __pycache__/
 *.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.pid
+*.out.log
+*.err.log
+*.tmp
+*.bak
+*.xlsx
+external/
 data/
 logs/
 reports/

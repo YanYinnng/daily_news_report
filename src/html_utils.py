@@ -49,3 +49,37 @@ def clean_text(value: str) -> str:
     value = re.sub(r"[ \t\r\f\v]+", " ", value)
     value = re.sub(r"\n\s*\n\s*\n+", "\n\n", value)
     return value.strip()
+
+
+class _HTMLImageParser(HTMLParser):
+    image_attrs = ("data-src", "src", "data-original", "data-url")
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.urls: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() != "img":
+            return
+        attr_map = {name.lower(): value for name, value in attrs if value}
+        for name in self.image_attrs:
+            value = attr_map.get(name)
+            if value and value not in self.urls:
+                self.urls.append(html.unescape(value))
+                break
+
+
+def extract_image_urls(value: str, limit: int = 5) -> list[str]:
+    if not value or "<" not in value:
+        return []
+    parser = _HTMLImageParser()
+    parser.feed(value)
+    return [url for url in parser.urls if _is_useful_image(url)][:limit]
+
+
+def _is_useful_image(url: str) -> bool:
+    lowered = url.lower()
+    if not lowered.startswith(("http://", "https://")):
+        return False
+    blocked = ("avatar", "profile_photo", "icon", "spacer", "tracking")
+    return not any(marker in lowered for marker in blocked)

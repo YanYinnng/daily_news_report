@@ -12,6 +12,10 @@ from .config import ConfigError
 from .models import ArticleContent, ArticleMeta
 
 
+_DANGLING_LABEL_RE = re.compile(r"^-?\s*\*\*[^*\n]{2,80}\*\*\s*[:\uFF1A]\s*$")
+_DANGLING_PLAIN_LABEL_RE = re.compile(r"^(一句话结论|结论|要点|核心要点|分条摘要)\s*[:\uFF1A]\s*$")
+
+
 class Summarizer:
     def __init__(self, settings: dict[str, Any]) -> None:
         self.base_url = os.getenv("LLM_BASE_URL", "").rstrip("/")
@@ -82,6 +86,8 @@ class Summarizer:
         article_text = article_text[: self.max_input_chars]
         if not article_text:
             raise RuntimeError("article text is empty")
+        profile = self._summary_profile(meta, article_text)
+        style_instruction = self._style_instruction(profile)
 
         user_prompt = f"""请用中文为下面这篇微信公众号文章写精简日报摘要。
 
@@ -90,6 +96,7 @@ class Summarizer:
 - 再列出 3-5 个要点。
 - 保留关键人物、公司、产品、数字、时间。
 - 不要编造原文没有的信息。
+- {style_instruction}
 
 公众号：{meta.account_name}
 标题：{meta.title}
@@ -99,12 +106,14 @@ class Summarizer:
 正文：
 {article_text}
 """
-        return self._chat(
+        summary = self._chat(
             [
                 {"role": "system", "content": "你是一个严谨的中文信息摘要助手，输出短而有信息密度。"},
                 {"role": "user", "content": user_prompt},
             ]
         )
+        self._ensure_complete_summary(summary)
+        return summary
 
     def summarize_overview(self, digests: list[str]) -> str:
         if not digests:
@@ -162,18 +171,18 @@ class Summarizer:
         response.raise_for_status()
         payload = response.json()
         try:
-            return payload["choices"][0]["message"]["content"].strip()
+            choice = payload["choices"][0]
+            finish_reason = choice.get("finish_reason")
+            content = choice["message"]["content"].strip()
         except (KeyError, IndexError, TypeError) as exc:
             raise RuntimeError(f"Unexpected LLM response shape: {payload}") from exc
-
-    def _parse_json_object(self, text: str) -> dict[str, Any]:
-        fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL)
-        candidate = fenced.group(1) if fenced else text
-        start = candidate.find("{")
-        end = candidate.rfind("}")
-        if start == -1 or end == -1 or end < start:
-            raise RuntimeError(f"LLM did not return a JSON object: {text[:500]}")
-        return json.loads(candidate[start : end + 1])
+        if finish_reason == "length":
+            raise RuntimeError(f"LLM response was truncated by max_tokens={self.max_tokens}")
+        if finish_reason and finish_reason not in {"stop", "length"}:
+            raise RuntimeError(f"LLM response ended unexpectedly: finish_reason={finish_reason}")
+        if not content:
+            raise RuntimeError("LLM response content is empty")
+        return content
 
     def _parse_numbered_summaries(self, text: str, expected_count: int) -> list[str]:
         matches = list(re.finditer(r"(?m)^###\s*(\d+)\s*$", text.strip()))
@@ -195,4 +204,42 @@ class Summarizer:
         result = [by_index.get(index, "") for index in range(1, expected_count + 1)]
         if any(not item for item in result):
             raise RuntimeError(f"Batch summary count mismatch: expected {expected_count}, got {len(by_index)}")
+        for summary in result:
+            self._ensure_complete_summary(summary)
         return result
+
+    def _ensure_complete_summary(self, summary: str) -> None:
+        lines = [line.strip() for line in summary.splitlines() if line.strip()]
+        if not lines:
+            raise RuntimeError("LLM summary is empty")
+        last_line = lines[-1]
+        if _DANGLING_LABEL_RE.match(last_line) or _DANGLING_PLAIN_LABEL_RE.match(last_line):
+            raise RuntimeError(f"LLM summary appears incomplete; dangling final label: {last_line}")
+        if "请提供文章的完整正文" in summary or "无法总结，因为正文" in summary:
+            raise RuntimeError("LLM summary indicates missing article text")
+
+    def _summary_profile(self, meta: ArticleMeta, article_text: str) -> str:
+        configured = str(meta.raw.get("summary_profile") or "").strip().lower()
+        if configured:
+            return configured
+        title = meta.title or ""
+        if re.search(r"(情报|日报|周报|月报|合集|汇总|通知|活动|招聘|日历|清单|速递|简讯|资讯)", title):
+            return "list_digest"
+        lines = [line.strip() for line in article_text.splitlines() if line.strip()]
+        bullet_lines = [
+            line
+            for line in lines
+            if re.match(r"^([-*•·]|[0-9一二三四五六七八九十]+[.、）)]|[（(][0-9一二三四五六七八九十]+[）)])", line)
+        ]
+        short_lines = [line for line in lines if len(line) <= 80]
+        if len(bullet_lines) >= 5 or (len(short_lines) >= 10 and len(short_lines) >= len(lines) * 0.55):
+            return "list_digest"
+        return "standard"
+
+    def _style_instruction(self, profile: str) -> str:
+        if profile == "list_digest":
+            return (
+                "如果原文是资讯列表、通知合集、活动/招聘清单、链接汇编或日报/周报型内容，"
+                "请按原条目分组概括，保留每条信息的对象、时间、地点、动作和链接线索；不要把所有条目压缩成一个笼统结论。"
+            )
+        return "如果原文是普通长文或评论文章，请按核心观点、关键事实和影响总结。"

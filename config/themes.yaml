@@ -1,0 +1,6 @@
+# Example configuration only. Enable a theme after configuring accounts.
+themes:
+  - id: ai
+    name: 示例主题
+    enabled: false
+    email_subject_prefix: "微信公众号日报 · 示例主题"

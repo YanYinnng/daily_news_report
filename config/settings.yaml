@@ -1,4 +1,4 @@
-source: justone
+source: mixed
 timezone: Asia/Shanghai
 daily_run_time: "12:00"
 lookback_hours: 24
@@ -8,13 +8,48 @@ summary_style: concise_daily
 ignore_env_proxy: false
 overview_mode: factual
 report_title: "微信公众号每日摘要"
-email_subject_prefix: "微信公众号每日摘要"
+email_subject_prefix: "微信公众号日报"
+login_reminder_interval_days: 3
 
 # Official Just One API docs list this as prod-cn, optional for Mainland China.
 # Switch back to https://api.justoneapi.com if your network can validate that certificate.
 justone_base_url: "http://47.117.133.51:30015"
+justone:
+  enabled: true
+
+# Optional local service from https://github.com/adennng/wechat-query-skill.
+# It uses a WeChat official-platform login session to fetch per-account appmsg lists,
+# which is more complete than public search fallback after you scan-login.
+wechat_download_api:
+  enabled: true
+  base_url: "http://localhost:5000"
+  account_cache_path: data/wechat_download_api_accounts.json
+  search_count: 5
+  articles_page_size: 50
+  max_pages: 3
+  fetch_full_content: true
+  request_interval_seconds: 1.5
+  article_fetch_interval_seconds: 3.0
+  freq_control_sleep_seconds: 75
+  freq_control_retries: 1
+
+source_health_cache_hours: 24
+source_audit_path: data/source_audit.json
 source_timeout_seconds: 60
 source_retries: 2
+source_parallel_workers: 1
+opencli_enabled: true
+opencli_command: opencli
+opencli_timeout_seconds: 60
+opencli_search_limit: 10
+opencli_download_dir: data/opencli_articles
+opencli_download_images: false
+opencli_verify_candidates: true
+opencli_browser_session: wechat_verify
+opencli_browser_wait_seconds: 8
+opencli_daily_candidate_grace_days: 1
+opencli_max_opened_candidates_per_account: 3
+opencli_verify_unknown_time_candidates: false
 wordpress_per_page: 30
 wordpress_timeout_seconds: 60
 rss_timeout_seconds: 60
@@ -30,10 +65,13 @@ llm_timeout_seconds: 120
 llm_retries: 2
 llm_max_input_chars_per_article: 12000
 llm_temperature: 0.2
-llm_max_tokens: 1200
+llm_max_tokens: 2000
 
 state_path: data/state.sqlite3
 lock_path: data/run.lock
 log_dir: logs
 reports_dir: reports
 include_raw_errors: true
+include_images: auto
+max_images_per_article: 2
+max_total_images_per_theme: 20

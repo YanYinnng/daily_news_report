@@ -7,7 +7,7 @@ from urllib.parse import urlencode
 
 import requests
 
-from ..html_utils import clean_text, html_to_text
+from ..html_utils import clean_text, extract_image_urls, html_to_text
 from ..models import Account, ArticleContent, ArticleMeta
 from ..timeutils import parse_datetime_value
 
@@ -36,7 +36,12 @@ class WordPressMirrorSource:
         response = requests.get(article_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=self.timeout_seconds)
         response.raise_for_status()
         text = html_to_text(response.text)
-        return ArticleContent(url=article_url, text=text, raw={"source": "wordpress-page"})
+        return ArticleContent(
+            url=article_url,
+            text=text,
+            image_urls=extract_image_urls(response.text),
+            raw={"source": "wordpress-page"},
+        )
 
     def supports_account(self, account: Account) -> bool:
         return bool(account.wordpress_api_url)
@@ -86,6 +91,7 @@ class WordPressMirrorSource:
             author=account.name,
             published_at=published_at,
             text=content_text or excerpt,
+            image_urls=extract_image_urls(content_html),
             raw={"source": "wordpress-api", **item},
         )
 

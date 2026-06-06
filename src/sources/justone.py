@@ -8,7 +8,7 @@ from urllib.parse import urljoin
 
 import requests
 
-from ..html_utils import clean_text
+from ..html_utils import clean_text, extract_image_urls
 from ..models import Account, ArticleContent, ArticleMeta
 from ..timeutils import parse_datetime_value
 from .base import SourceError
@@ -97,13 +97,15 @@ class JustOneWeChatSource:
                 "digest",
             ),
         )
-        content_text = clean_text(_stringify(content_value) or self._longest_string(detail) or "")
+        content_html = _stringify(content_value) or self._longest_string(detail) or ""
+        content_text = clean_text(content_html)
         return ArticleContent(
             url=article_url,
             title=title,
             author=author,
             published_at=published_at,
             text=content_text,
+            image_urls=extract_image_urls(content_html),
             raw=detail,
         )
 

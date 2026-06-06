@@ -8,7 +8,7 @@ from xml.etree import ElementTree
 
 import requests
 
-from ..html_utils import clean_text, html_to_text
+from ..html_utils import clean_text, extract_image_urls, html_to_text
 from ..models import Account, ArticleContent, ArticleMeta
 from ..timeutils import parse_datetime_value
 
@@ -40,7 +40,12 @@ class RssSource:
             return cached
         response = requests.get(article_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=self.timeout_seconds)
         response.raise_for_status()
-        page_content = ArticleContent(url=article_url, text=html_to_text(response.text), raw={"source": "rss-page"})
+        page_content = ArticleContent(
+            url=article_url,
+            text=html_to_text(response.text),
+            image_urls=extract_image_urls(response.text),
+            raw={"source": "rss-page"},
+        )
         if cached:
             page_content.title = cached.title
             page_content.author = cached.author
@@ -96,6 +101,7 @@ class RssSource:
             author=account.name,
             published_at=published_at,
             text=text,
+            image_urls=extract_image_urls(description),
             raw={"source": "rss", "feed": account.rss_url},
         )
         return ArticleMeta(
