@@ -198,12 +198,30 @@ class OpenCliWeixinSource:
         final_url = str(response.url or article_url)
         if "weixin.sogou.com/antispider" in final_url or "weixin.sogou.com/" in final_url:
             raise SourceError("Sogou candidate URL did not resolve to a readable WeChat article page")
+        if self._is_wechat_gate_page(final_url, response.text):
+            raise SourceError("WeChat article page requires captcha or did not expose article text")
+        text = html_to_text(response.text)
+        if not text.strip():
+            raise SourceError("requests fallback returned empty article text")
         return ArticleContent(
             url=final_url,
-            text=html_to_text(response.text),
+            text=text,
             image_urls=extract_image_urls(response.text),
             raw={"source": "opencli-requests-fallback", "original_url": article_url},
         )
+
+    def _is_wechat_gate_page(self, final_url: str, html: str) -> bool:
+        lowered_url = final_url.lower()
+        if "wappoc_appmsgcaptcha" in lowered_url or "target_url=" in lowered_url:
+            return True
+        markers = (
+            "wappoc_appmsgcaptcha",
+            "poc_token",
+            "环境异常",
+            "请进行验证",
+            "验证码",
+        )
+        return any(marker in html for marker in markers)
 
     def _finalize_recent_posts(self, account: Account, metas: list[ArticleMeta], limit: int) -> list[ArticleMeta]:
         metas.sort(key=lambda item: item.published_at or datetime.min, reverse=True)
@@ -396,7 +414,7 @@ JSON.stringify((() => {
         if completed.returncode != 0:
             stderr = completed.stderr.strip()
             stdout = completed.stdout.strip()
-            raise SourceError(f"opencli failed: {stderr or stdout}")
+            raise SourceError(self._format_opencli_error(stderr, stdout, browser=False))
         return self._parse_json_output(completed.stdout)
 
     def _parse_json_output(self, output: str) -> Any:
@@ -432,8 +450,38 @@ JSON.stringify((() => {
         if completed.returncode != 0:
             stderr = completed.stderr.strip()
             stdout = completed.stdout.strip()
-            raise SourceError(f"opencli browser failed: {stderr or stdout}")
+            raise SourceError(self._format_opencli_error(stderr, stdout, browser=True))
         return completed.stdout.strip()
+
+    def _format_opencli_error(self, stderr: str, stdout: str, browser: bool) -> str:
+        raw = "\n".join(part for part in (stderr.strip(), stdout.strip()) if part).strip()
+        prefix = "opencli browser failed" if browser else "opencli failed"
+        if "BROWSER_CONNECT" in raw or "Browser Bridge extension not connected" in raw:
+            return f"{prefix}: Browser Bridge extension not connected (BROWSER_CONNECT)"
+        if "EMPTY_RESULT" in raw:
+            return f"{prefix}: EMPTY_RESULT"
+
+        payload = None
+        for candidate in (stdout, raw):
+            try:
+                payload = self._parse_json_output(candidate)
+                break
+            except SourceError:
+                continue
+        if isinstance(payload, dict):
+            error = payload.get("error")
+            if isinstance(error, dict):
+                code = str(error.get("code") or "").strip()
+                message = clean_text(str(error.get("message") or "")).strip()
+                if code and message:
+                    return f"{prefix}: {message} ({code})"
+                if message:
+                    return f"{prefix}: {message}"
+
+        compact = re.sub(r"\(node:\d+\)\s*\[[^\]]+]\s*Warning:.*?(?:\n|$)", "", raw)
+        compact = re.sub(r"\(Use `node --trace-warnings .*?\)\s*", "", compact)
+        compact = clean_text(compact)
+        return f"{prefix}: {compact[:500] or 'unknown error'}"
 
     def _resolve_command(self) -> str:
         candidates = [self.command]

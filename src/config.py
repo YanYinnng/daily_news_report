@@ -13,13 +13,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 DEFAULT_SETTINGS: dict[str, Any] = {
-    "source": "mixed",
     "timezone": "Asia/Shanghai",
     "daily_run_time": "12:00",
     "lookback_hours": 24,
     "send_empty_report": True,
     "missed_run_policy": "run_on_next_startup",
-    "summary_style": "concise_daily",
     "ignore_env_proxy": False,
     "overview_mode": "factual",
     "report_title": "微信公众号每日摘要",
@@ -44,7 +42,6 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "source_audit_path": "data/source_audit.json",
     "source_timeout_seconds": 60,
     "source_retries": 2,
-    "source_parallel_workers": 1,
     "opencli_enabled": True,
     "opencli_command": "opencli",
     "opencli_timeout_seconds": 60,
@@ -75,7 +72,6 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "lock_path": "data/run.lock",
     "log_dir": "logs",
     "reports_dir": "reports",
-    "include_raw_errors": True,
     "include_images": "auto",
     "max_images_per_article": 2,
     "max_total_images_per_theme": 20,
@@ -175,11 +171,9 @@ def load_accounts(project_root: Path = PROJECT_ROOT) -> list[Account]:
         wordpress_api_url = str(item.get("wordpress_api_url", "")).strip() or None
         article_library_api_url = str(item.get("article_library_api_url", "")).strip() or None
         rss_url = str(item.get("rss_url", "")).strip() or None
-        official_url = str(item.get("official_url", "")).strip() or None
         wechat_fakeid = str(item.get("wechat_fakeid", "")).strip() or None
         opencli_query = str(item.get("opencli_query", "")).strip() or None
         summary_profile = str(item.get("summary_profile", "")).strip() or None
-        source_priority = _parse_source_priority(item.get("source_priority", ()))
         if name and wxid:
             accounts.append(
                 Account(
@@ -190,22 +184,12 @@ def load_accounts(project_root: Path = PROJECT_ROOT) -> list[Account]:
                     wordpress_api_url=wordpress_api_url,
                     article_library_api_url=article_library_api_url,
                     rss_url=rss_url,
-                    official_url=official_url,
                     wechat_fakeid=wechat_fakeid,
                     opencli_query=opencli_query,
                     summary_profile=summary_profile,
-                    source_priority=source_priority,
                 )
             )
     return accounts
-
-
-def _parse_source_priority(value: Any) -> tuple[str, ...]:
-    if isinstance(value, str):
-        return tuple(part.strip() for part in value.split(",") if part.strip())
-    if isinstance(value, list):
-        return tuple(str(part).strip() for part in value if str(part).strip())
-    return ()
 
 
 def require_env(keys: list[str]) -> dict[str, str]:

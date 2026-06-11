@@ -10,7 +10,7 @@
 - 主题配置：`config/themes.yaml`，请在本地配置自己的主题。
 - 报告模式：每个主题一份报告，每篇推文单独总结。
 - 邮件模式：每个主题一封邮件，标题包含主题名和日期。
-- 数据源顺序：`wechat-download-api` 后台文章列表源为主链路，稳定渠道、Just One、opencli 依次兜底。
+- 数据源顺序：`wechat-download-api` 优先；账号显式配置的稳定渠道只在主链路没拿到文章时兜底，再由 Just One、opencli 兜底。
 - 自动任务：Windows 任务计划程序每天 12:00 运行，错过后通过登录/启动补跑。
 - 本地浏览：`serve-reports` 可在 `http://127.0.0.1:8765` 查看历史日报，兼容多主题目录和旧版扁平报告。
 
@@ -165,14 +165,9 @@ schtasks /Query /TN WeChatDailyDigestNoon /V /FO LIST
   enabled: true
   opencli_query: 示例公众号
   wechat_fakeid: ""
-  source_priority:
-    - official
-    - wechat_api
-    - justone
-    - opencli
 ```
 
-如果有稳定渠道，优先补充 `rss_url`、`wordpress_api_url` 或 `article_library_api_url`。`source_priority` 目前作为配置说明和后续切换预留；实际运行顺序仍按全局策略执行。
+如果有稳定渠道，优先补充 `rss_url`、`wordpress_api_url` 或 `article_library_api_url`。数据源优先级由代码中的全局混合数据源策略控制，不在单个账号里单独配置。
 
 `config/settings.yaml` 里常用设置：
 
@@ -206,7 +201,7 @@ wechat_download_api:
 运行时按这个顺序采集：
 
 1. `wechat-download-api`：通过微信公众号后台登录态按 `fakeid` 拉取公众号文章列表，并按 12:00-12:00 日报窗口过滤。
-2. 稳定渠道：WordPress API、文章库 API、RSS，仅在主链路失败时兜底。
+2. 稳定渠道：WordPress API、文章库 API、RSS；只对账号里显式配置了对应 URL 的公众号生效，作为主链路没拿到文章时的兜底，不视为公众号全集镜像。
 3. Just One：只有 `config/settings.yaml` 中启用且 `data/source_health.json` 没有临时禁用时才使用。
 4. opencli 微信搜索：最后兜底，会打开候选微信原文页，核验公众号名和发布时间后才收录。
 

@@ -6,6 +6,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
+from .html_utils import normalize_image_url
 from .models import ArticleDigest, RunIssue
 
 
@@ -199,7 +200,9 @@ def build_html(
                 if image_urls:
                     body.append("<div class='article-images'>")
                     for image_url in image_urls:
-                        body.append(f"<img src='{html.escape(image_url)}' alt='article image'>")
+                        body.append(
+                            f"<img src='{html.escape(image_url, quote=True)}' alt='article image' loading='lazy' decoding='async' referrerpolicy='no-referrer'>"
+                        )
                     body.append("</div>")
                     remaining_images -= len(image_urls)
                 article_index += 1
@@ -301,7 +304,8 @@ def article_image_urls(digest: ArticleDigest, settings: dict[str, Any], remainin
     if limit <= 0:
         return []
     urls: list[str] = []
-    for url in digest.content.image_urls:
+    for raw_url in digest.content.image_urls:
+        url = normalize_image_url(raw_url)
         if not url.startswith(("http://", "https://")):
             continue
         if url not in urls:

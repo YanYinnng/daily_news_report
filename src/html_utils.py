@@ -64,8 +64,9 @@ class _HTMLImageParser(HTMLParser):
         attr_map = {name.lower(): value for name, value in attrs if value}
         for name in self.image_attrs:
             value = attr_map.get(name)
-            if value and value not in self.urls:
-                self.urls.append(html.unescape(value))
+            url = normalize_image_url(value or "")
+            if url and url not in self.urls:
+                self.urls.append(url)
                 break
 
 
@@ -77,7 +78,26 @@ def extract_image_urls(value: str, limit: int = 5) -> list[str]:
     return [url for url in parser.urls if _is_useful_image(url)][:limit]
 
 
+def normalize_image_url(value: str) -> str:
+    url = (value or "").strip()
+    if not url:
+        return ""
+    for _ in range(3):
+        unescaped = html.unescape(url)
+        if unescaped == url:
+            break
+        url = unescaped
+    url = (
+        url.replace("\\x26amp;", "&")
+        .replace("\\x26", "&")
+        .replace("\\u0026amp;", "&")
+        .replace("\\u0026", "&")
+    )
+    return url.strip()
+
+
 def _is_useful_image(url: str) -> bool:
+    url = normalize_image_url(url)
     lowered = url.lower()
     if not lowered.startswith(("http://", "https://")):
         return False

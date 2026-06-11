@@ -99,6 +99,8 @@ class JustOneWeChatSource:
         )
         content_html = _stringify(content_value) or self._longest_string(detail) or ""
         content_text = clean_text(content_html)
+        if not content_text.strip():
+            raise SourceError("Just One returned empty article text")
         return ArticleContent(
             url=article_url,
             title=title,

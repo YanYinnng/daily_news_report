@@ -1,10 +1,8 @@
-source: mixed
 timezone: Asia/Shanghai
 daily_run_time: "12:00"
 lookback_hours: 24
 send_empty_report: true
 missed_run_policy: run_on_next_startup
-summary_style: concise_daily
 ignore_env_proxy: false
 overview_mode: factual
 report_title: "微信公众号每日摘要"
@@ -37,7 +35,6 @@ source_health_cache_hours: 24
 source_audit_path: data/source_audit.json
 source_timeout_seconds: 60
 source_retries: 2
-source_parallel_workers: 1
 opencli_enabled: true
 opencli_command: opencli
 opencli_timeout_seconds: 60
@@ -65,13 +62,12 @@ llm_timeout_seconds: 120
 llm_retries: 2
 llm_max_input_chars_per_article: 12000
 llm_temperature: 0.2
-llm_max_tokens: 2000
+llm_max_tokens: 4000
 
 state_path: data/state.sqlite3
 lock_path: data/run.lock
 log_dir: logs
 reports_dir: reports
-include_raw_errors: true
 include_images: auto
 max_images_per_article: 2
 max_total_images_per_theme: 20

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import html
+import ipaddress
 import json
 import logging
 import re
@@ -9,9 +11,12 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.request import Request, urlopen
 
 from .config import load_themes, resolve_project_path
+from .html_utils import normalize_image_url
 
 
 LEGACY_THEME_ID = "__legacy__"
@@ -19,6 +24,16 @@ LEGACY_THEME_NAME = "全部主题（旧版）"
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 ARTICLE_COUNT_RE = re.compile(r"新文章数\s*[：:]\s*(\d+)")
 SAFE_THEME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+IMG_SRC_RE = re.compile(r"(<img\b[^>]*?\bsrc\s*=\s*)(['\"])(.*?)(\2)([^>]*>)", re.IGNORECASE | re.DOTALL)
+IMAGE_PROXY_MAX_BYTES = 10 * 1024 * 1024
+IMAGE_PROXY_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+}
 
 
 @dataclass(frozen=True)
@@ -90,6 +105,9 @@ def make_handler(project_root: Path, reports_dir: Path) -> type[BaseHTTPRequestH
             if parsed.path == "/api/report":
                 self._send_report(parse_qs(parsed.query))
                 return
+            if parsed.path == "/api/image":
+                self._send_image(parse_qs(parsed.query))
+                return
             if parsed.path == "/favicon.ico":
                 self._send_bytes(HTTPStatus.NO_CONTENT, "image/x-icon", b"")
                 return
@@ -113,7 +131,33 @@ def make_handler(project_root: Path, reports_dir: Path) -> type[BaseHTTPRequestH
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "report_not_found"})
                 return
             content_type = "text/html; charset=utf-8" if report_format == "html" else "text/plain; charset=utf-8"
-            self._send_bytes(HTTPStatus.OK, content_type, report_path.read_bytes())
+            if report_format == "html":
+                body = rewrite_report_html_images(report_path.read_text(encoding="utf-8", errors="replace")).encode("utf-8")
+            else:
+                body = report_path.read_bytes()
+            self._send_bytes(HTTPStatus.OK, content_type, body)
+
+        def _send_image(self, query: dict[str, list[str]]) -> None:
+            image_url = resolve_remote_image_url(first_query_value(query, "url") or "")
+            if not image_url:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_image_url"})
+                return
+            try:
+                content_type, body = fetch_remote_image(image_url)
+            except ImageProxyError as exc:
+                logging.warning("Image proxy failed for %s: %s", image_url, exc)
+                self._send_bytes(
+                    HTTPStatus.BAD_GATEWAY,
+                    "text/plain; charset=utf-8",
+                    "image_fetch_failed".encode("utf-8"),
+                )
+                return
+            self._send_bytes(
+                HTTPStatus.OK,
+                content_type,
+                body,
+                cache_control="public, max-age=86400",
+            )
 
         def _send_json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
             self._send_bytes(
@@ -122,11 +166,18 @@ def make_handler(project_root: Path, reports_dir: Path) -> type[BaseHTTPRequestH
                 json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"),
             )
 
-        def _send_bytes(self, status: HTTPStatus, content_type: str, body: bytes) -> None:
+        def _send_bytes(
+            self,
+            status: HTTPStatus,
+            content_type: str,
+            body: bytes,
+            cache_control: str = "no-store",
+        ) -> None:
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
+            self.send_header("Cache-Control", cache_control)
+            self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             if body:
                 self.wfile.write(body)
@@ -137,6 +188,85 @@ def make_handler(project_root: Path, reports_dir: Path) -> type[BaseHTTPRequestH
 def first_query_value(query: dict[str, list[str]], key: str) -> str | None:
     values = query.get(key) or []
     return values[0].strip() if values else None
+
+
+class ImageProxyError(RuntimeError):
+    pass
+
+
+def rewrite_report_html_images(html_text: str) -> str:
+    def replace_src(match: re.Match[str]) -> str:
+        prefix, quote, raw_src, _, suffix = match.groups()
+        image_url = resolve_remote_image_url(html.unescape(raw_src))
+        if not image_url:
+            return match.group(0)
+        proxied_src = "/api/image?" + urlencode({"url": image_url})
+        return f"{prefix}{quote}{html.escape(proxied_src, quote=True)}{quote}{ensure_image_attrs(suffix)}"
+
+    return IMG_SRC_RE.sub(replace_src, html_text)
+
+
+def ensure_image_attrs(suffix: str) -> str:
+    additions = []
+    if not re.search(r"\sloading\s*=", suffix, re.IGNORECASE):
+        additions.append("loading='lazy'")
+    if not re.search(r"\sdecoding\s*=", suffix, re.IGNORECASE):
+        additions.append("decoding='async'")
+    if not re.search(r"\sreferrerpolicy\s*=", suffix, re.IGNORECASE):
+        additions.append("referrerpolicy='no-referrer'")
+    if not additions or not suffix.endswith(">"):
+        return suffix
+    return suffix[:-1].rstrip() + " " + " ".join(additions) + ">"
+
+
+def resolve_remote_image_url(value: str) -> str | None:
+    url = normalize_image_url(value)
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    if is_blocked_proxy_host(parsed.hostname or ""):
+        return None
+    return url
+
+
+def is_blocked_proxy_host(host: str) -> bool:
+    lowered = host.strip("[]").lower()
+    if not lowered or lowered == "localhost" or lowered.endswith(".localhost"):
+        return True
+    try:
+        address = ipaddress.ip_address(lowered)
+    except ValueError:
+        return False
+    return (
+        address.is_loopback
+        or address.is_link_local
+        or address.is_private
+        or address.is_reserved
+        or address.is_multicast
+    )
+
+
+def fetch_remote_image(url: str) -> tuple[str, bytes]:
+    parsed = urlparse(url)
+    headers = {
+        **IMAGE_PROXY_HEADERS,
+        "Referer": f"{parsed.scheme}://{parsed.netloc}/",
+    }
+    request = Request(url, headers=headers)
+    try:
+        with urlopen(request, timeout=20) as response:
+            content_type = response.headers.get("Content-Type", "application/octet-stream")
+            media_type = content_type.split(";", 1)[0].strip().lower()
+            if not media_type.startswith("image/"):
+                raise ImageProxyError(f"not an image: {content_type}")
+            body = response.read(IMAGE_PROXY_MAX_BYTES + 1)
+    except (HTTPError, URLError, TimeoutError, OSError) as exc:
+        raise ImageProxyError(str(exc)) from exc
+    if len(body) > IMAGE_PROXY_MAX_BYTES:
+        raise ImageProxyError("image too large")
+    if not body:
+        raise ImageProxyError("empty image body")
+    return media_type, body
 
 
 def build_report_index(project_root: Path, reports_dir: Path) -> dict[str, Any]:

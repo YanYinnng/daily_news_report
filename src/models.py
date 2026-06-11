@@ -22,11 +22,9 @@ class Account:
     wordpress_api_url: str | None = None
     article_library_api_url: str | None = None
     rss_url: str | None = None
-    official_url: str | None = None
     wechat_fakeid: str | None = None
     opencli_query: str | None = None
     summary_profile: str | None = None
-    source_priority: tuple[str, ...] = field(default_factory=tuple)
 
 
 @dataclass

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime
+from typing import Callable
 
 from ..models import Account, ArticleContent, ArticleMeta
 from .base import SourceError, WeChatSource
@@ -30,24 +32,31 @@ class CompositeWeChatSource:
 
     def list_posts(self, account: Account, since: datetime, until: datetime) -> list[ArticleMeta]:
         if self.wechat_download_api and self.wechat_download_api.supports_account(account):
-            try:
-                return self.wechat_download_api.list_posts(account, since, until)
-            except Exception:
-                pass
+            posts = self._try_list(
+                "wechat-download-api",
+                account,
+                lambda: self.wechat_download_api.list_posts(account, since, until),
+            )
+            if posts:
+                return posts
         if self.wordpress.supports_account(account):
-            posts = self._try_list(lambda: self.wordpress.list_posts(account, since, until))
+            posts = self._try_list("wordpress-api", account, lambda: self.wordpress.list_posts(account, since, until))
             if posts:
                 return posts
         if self.article_library.supports_account(account):
-            posts = self._try_list(lambda: self.article_library.list_posts(account, since, until))
+            posts = self._try_list(
+                "article-library-api",
+                account,
+                lambda: self.article_library.list_posts(account, since, until),
+            )
             if posts:
                 return posts
         if self.rss.supports_account(account):
-            posts = self._try_list(lambda: self.rss.list_posts(account, since, until))
+            posts = self._try_list("rss", account, lambda: self.rss.list_posts(account, since, until))
             if posts:
                 return posts
         if self.primary:
-            posts = self._try_list(lambda: self.primary.list_posts(account, since, until))
+            posts = self._try_list("primary", account, lambda: self.primary.list_posts(account, since, until))
             if posts:
                 return posts
         if self.opencli:
@@ -56,24 +65,35 @@ class CompositeWeChatSource:
 
     def list_recent_posts(self, account: Account, limit: int = 10) -> list[ArticleMeta]:
         if self.wechat_download_api and self.wechat_download_api.supports_account(account):
-            try:
-                return self.wechat_download_api.list_recent_posts(account, limit)
-            except Exception:
-                pass
+            posts = self._try_list(
+                "wechat-download-api",
+                account,
+                lambda: self.wechat_download_api.list_recent_posts(account, limit),
+            )
+            if posts:
+                return posts
         if self.wordpress.supports_account(account):
-            posts = self._try_list(lambda: self.wordpress.list_recent_posts(account, limit))
+            posts = self._try_list(
+                "wordpress-api",
+                account,
+                lambda: self.wordpress.list_recent_posts(account, limit),
+            )
             if posts:
                 return posts
         if self.article_library.supports_account(account):
-            posts = self._try_list(lambda: self.article_library.list_recent_posts(account, limit))
+            posts = self._try_list(
+                "article-library-api",
+                account,
+                lambda: self.article_library.list_recent_posts(account, limit),
+            )
             if posts:
                 return posts
         if self.rss.supports_account(account):
-            posts = self._try_list(lambda: self.rss.list_recent_posts(account, limit))
+            posts = self._try_list("rss", account, lambda: self.rss.list_recent_posts(account, limit))
             if posts:
                 return posts
         if self.primary:
-            posts = self._try_list(lambda: self.primary.list_recent_posts(account, limit))
+            posts = self._try_list("primary", account, lambda: self.primary.list_recent_posts(account, limit))
             if posts:
                 return posts
         if self.opencli:
@@ -103,8 +123,14 @@ class CompositeWeChatSource:
             return self.opencli.fetch_article(article_url)
         raise SourceError(f"No usable source configured for article URL: {article_url}")
 
-    def _try_list(self, callback) -> list[ArticleMeta]:
+    def _try_list(
+        self,
+        source_name: str,
+        account: Account,
+        callback: Callable[[], list[ArticleMeta]],
+    ) -> list[ArticleMeta]:
         try:
             return callback()
-        except Exception:
+        except Exception as exc:
+            logging.warning("List source %s failed for %s (%s): %s", source_name, account.name, account.wxid, exc)
             return []

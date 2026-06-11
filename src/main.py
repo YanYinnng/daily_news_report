@@ -844,8 +844,6 @@ def stable_sources_for_account(account: Account) -> list[str]:
         sources.append("article_library_api")
     if account.rss_url:
         sources.append("rss")
-    if account.official_url:
-        sources.append("official_url")
     if account.wechat_fakeid:
         sources.append("wechat_download_api_fakeid")
     return sources
