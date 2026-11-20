@@ -7,6 +7,8 @@ from urllib.parse import urlencode
 
 import requests
 
+from .cache import ContentCache
+
 from ..html_utils import clean_text, extract_image_urls, html_to_text
 from ..models import Account, ArticleContent, ArticleMeta
 from ..timeutils import parse_datetime_value
@@ -17,7 +19,7 @@ class WordPressMirrorSource:
         self.timeout_seconds = timeout_seconds
         self.timezone_name = timezone_name
         self.per_page = per_page
-        self._content_cache: dict[str, ArticleContent] = {}
+        self._content_cache = ContentCache()
 
     def list_posts(self, account: Account, since: datetime, until: datetime) -> list[ArticleMeta]:
         metas = self._fetch_posts(account)
@@ -25,7 +27,7 @@ class WordPressMirrorSource:
 
     def list_recent_posts(self, account: Account, limit: int = 10) -> list[ArticleMeta]:
         metas = self._fetch_posts(account)
-        metas.sort(key=lambda item: item.published_at or datetime.min, reverse=True)
+        metas.sort(key=lambda item: item.published_at.timestamp() if item.published_at else float("-inf"), reverse=True)
         return metas[:limit]
 
     def fetch_article(self, article_url: str) -> ArticleContent:
@@ -92,7 +94,7 @@ class WordPressMirrorSource:
             published_at=published_at,
             text=content_text or excerpt,
             image_urls=extract_image_urls(content_html),
-            raw={"source": "wordpress-api", **item},
+            raw={"source": "wordpress-api", "id": item.get("id")},
         )
 
         return ArticleMeta(

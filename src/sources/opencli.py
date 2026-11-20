@@ -10,6 +10,8 @@ from typing import Any
 
 import requests
 
+from .cache import ContentCache
+
 from ..html_utils import clean_text, extract_image_urls, html_to_text
 from ..models import Account, ArticleContent, ArticleMeta
 from ..timeutils import parse_datetime_value
@@ -44,7 +46,7 @@ class OpenCliWeixinSource:
         self.daily_candidate_grace_days = daily_candidate_grace_days
         self.max_opened_candidates_per_account = max_opened_candidates_per_account
         self.verify_unknown_time_candidates = verify_unknown_time_candidates
-        self._content_cache: dict[str, ArticleContent] = {}
+        self._content_cache = ContentCache()
 
     def list_posts(self, account: Account, since: datetime, until: datetime) -> list[ArticleMeta]:
         results: list[ArticleMeta] = []
@@ -70,7 +72,7 @@ class OpenCliWeixinSource:
 
                 if meta.published_at and since <= meta.published_at < until:
                     results.append(meta)
-        results.sort(key=lambda item: item.published_at or datetime.min)
+        results.sort(key=lambda item: item.published_at.timestamp() if item.published_at else float("-inf"))
         return results
 
     def list_recent_posts(self, account: Account, limit: int = 10) -> list[ArticleMeta]:
@@ -189,7 +191,7 @@ class OpenCliWeixinSource:
             published_at=parse_datetime_value(item.get("publish_time"), self.timezone_name),
             text=text,
             image_urls=image_urls,
-            raw={"source": "opencli-download", **item},
+            raw={"source": "opencli-download"},
         )
 
     def _fetch_with_requests(self, article_url: str) -> ArticleContent:
@@ -224,7 +226,7 @@ class OpenCliWeixinSource:
         return any(marker in html for marker in markers)
 
     def _finalize_recent_posts(self, account: Account, metas: list[ArticleMeta], limit: int) -> list[ArticleMeta]:
-        metas.sort(key=lambda item: item.published_at or datetime.min, reverse=True)
+        metas.sort(key=lambda item: item.published_at.timestamp() if item.published_at else float("-inf"), reverse=True)
         metas = metas[:limit]
         if not self.verify_candidates:
             return metas
@@ -237,7 +239,7 @@ class OpenCliWeixinSource:
                 continue
             if verified_meta:
                 verified.append(verified_meta)
-        verified.sort(key=lambda item: item.published_at or datetime.min, reverse=True)
+        verified.sort(key=lambda item: item.published_at.timestamp() if item.published_at else float("-inf"), reverse=True)
         return verified[:limit]
 
     def _verify_meta(self, account: Account, meta: ArticleMeta) -> ArticleMeta | None:
@@ -280,8 +282,8 @@ class OpenCliWeixinSource:
             return cached
 
         session = self._browser_session_for(article_url)
-        self._run_browser(["browser", session, "open", article_url], timeout=self.timeout_seconds)
         try:
+            self._run_browser(["browser", session, "open", article_url], timeout=self.timeout_seconds)
             self._wait_for_wechat_article(session)
             data = self._read_wechat_article_dom(session)
         finally:

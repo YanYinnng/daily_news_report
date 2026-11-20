@@ -1,25 +1,45 @@
 timezone: Asia/Shanghai
-daily_run_time: "12:00"
+source: weread
+daily_run_time: "08:00"
+report_window: previous_calendar_day
 lookback_hours: 24
 send_empty_report: true
 missed_run_policy: run_on_next_startup
+daily_preflight: true
 ignore_env_proxy: false
 overview_mode: factual
 report_title: "微信公众号每日摘要"
 email_subject_prefix: "微信公众号日报"
 login_reminder_interval_days: 3
 
-# Official Just One API docs list this as prod-cn, optional for Mainland China.
-# Switch back to https://api.justoneapi.com if your network can validate that certificate.
-justone_base_url: "http://47.117.133.51:30015"
-justone:
+# Primary collection route. Daily scheduling is configured separately at 08:00.
+weread:
   enabled: true
+  session_path: data/weread_session.json
+  identity_path: data/wechat_download_api_accounts.json
+  health_path: data/weread_health.json
+  request_interval_seconds: 5
+  max_pages: 5
+  image_ocr: true
+  ocr_max_images: 20
+
+# Current official HTTPS endpoint; system certificate trust is enabled at startup.
+justone_base_url: "https://api.justoneapi.com"
+justone:
+  enabled: false
+  prefer_for_lists: false
+  max_pages: 5
+  request_interval_seconds: 2.0
+  account_cache_path: data/justone_accounts.json
 
 # Optional local service from https://github.com/adennng/wechat-query-skill.
-# It uses a WeChat official-platform login session to fetch per-account appmsg lists,
-# which is more complete than public search fallback after you scan-login.
+# Its old cross-account list is paused; known-link article reading is optional.
 wechat_download_api:
-  enabled: true
+  enabled: false
+  # Upstream maintainer reports the cross-account list endpoint is unavailable:
+  # https://github.com/tmwgsicp/wechat-download-api/issues/22
+  # Keep known-URL article reading; audit-wechat remains an explicit diagnostic.
+  article_list_enabled: false
   base_url: "http://localhost:5000"
   account_cache_path: data/wechat_download_api_accounts.json
   search_count: 5
@@ -27,15 +47,20 @@ wechat_download_api:
   max_pages: 3
   fetch_full_content: true
   request_interval_seconds: 1.5
-  article_fetch_interval_seconds: 3.0
+  # Service default is at most 5 article requests per minute per client.
+  article_fetch_interval_seconds: 13.0
   freq_control_sleep_seconds: 75
   freq_control_retries: 1
+  failure_cooldown_seconds: 300
+  # A shared WeChat rate limit stops all account retries, including future CLI invocations.
+  rate_limit_cooldown_seconds: 1800
+  health_path: data/wechat_download_api_health.json
 
 source_health_cache_hours: 24
 source_audit_path: data/source_audit.json
 source_timeout_seconds: 60
 source_retries: 2
-opencli_enabled: true
+opencli_enabled: false
 opencli_command: opencli
 opencli_timeout_seconds: 60
 opencli_search_limit: 10
@@ -55,6 +80,8 @@ max_articles_per_account: 0
 max_total_articles: 0
 summary_mode: individual
 llm_parallel_workers: 3
+# Fetch at most this many full articles before summarizing and releasing bodies.
+article_buffer_size: 6
 llm_batch_size: 3
 llm_batch_article_chars: 1800
 
@@ -63,11 +90,21 @@ llm_retries: 2
 llm_max_input_chars_per_article: 12000
 llm_temperature: 0.2
 llm_max_tokens: 4000
+# DeepSeek defaults to thinking, which can consume the full output budget.
+llm_thinking: disabled
+llm_truncation_retries: 1
+llm_truncation_max_tokens: 8000
 
 state_path: data/state.sqlite3
 lock_path: data/run.lock
 log_dir: logs
 reports_dir: reports
 include_images: auto
-max_images_per_article: 2
-max_total_images_per_theme: 20
+max_images_per_article: 3
+max_total_images_per_theme: 30
+image_selection:
+  enabled: true
+  max_candidates_per_article: 20
+  cache_dir: data/image_selection
+  min_score: 55
+  request_interval_seconds: 1

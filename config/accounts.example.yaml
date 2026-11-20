@@ -1,0 +1,8 @@
+# Copy to accounts.yaml (ignored by Git). Replace with your own public account.
+accounts:
+  - name: 示例公众号
+    wxid: replace_with_wechat_id
+    theme: ai
+    # Use the __biz value from a verified public article of the same account.
+    wechat_fakeid: ""
+    enabled: false

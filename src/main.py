@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import argparse
-import concurrent.futures
 import json
 import logging
 import os
-import re
 import sys
+from dataclasses import asdict
+from contextlib import ExitStack
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -23,13 +23,14 @@ from .config import (
 )
 from .mailer import send_email
 from .models import Account, ArticleContent, ArticleDigest, ArticleMeta, RunIssue, Theme
-from .report import build_html, build_markdown, write_reports
+from .report import build_html, build_markdown, report_image_plan, write_reports
 from .source_health import get_source_health, mark_source_healthy, mark_source_unhealthy
 from .sources import make_source
 from .sources.justone import JustOneWeChatSource
-from .state import StateStore, run_lock
+from .state import RunAlreadyActive, StateStore, run_lock
+from .processing import build_overview, dedupe_articles, limit_articles, process_articles
 from .summarizer import Summarizer
-from .timeutils import latest_due_schedule_date, now_in_timezone, parse_time_of_day, scheduled_window
+from .timeutils import calendar_window, latest_due_schedule_date, now_in_timezone, parse_time_of_day, scheduled_window
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -44,7 +45,9 @@ def main(argv: list[str] | None = None) -> int:
     run_parser = subparsers.add_parser("run", help="Generate reports for the latest due schedule date")
     run_parser.add_argument("--no-email", action="store_true", help="Generate files but do not send email")
     run_parser.add_argument("--force", action="store_true", help="Regenerate even if this date already succeeded")
-    run_parser.add_argument("--date", help="Schedule date to generate, formatted as YYYY-MM-DD")
+    day_group = run_parser.add_mutually_exclusive_group()
+    day_group.add_argument("--date", help="Schedule date to generate, formatted as YYYY-MM-DD")
+    day_group.add_argument("--calendar-day", help="Natural day 00:00-24:00, YYYY-MM-DD; separate reports/state")
     run_parser.add_argument("--theme", help="Theme id or name to generate")
 
     catch_parser = subparsers.add_parser("catch-up", help="Generate the latest due reports only if missing")
@@ -54,8 +57,12 @@ def main(argv: list[str] | None = None) -> int:
     send_parser = subparsers.add_parser("send-report", help="Send existing report files by email")
     send_parser.add_argument("--date", required=True, help="Schedule date to send, formatted as YYYY-MM-DD")
     send_parser.add_argument("--theme", help="Theme id or name to send")
+    send_parser.add_argument("--calendar", action="store_true", help="Send reports generated with --calendar-day")
+    send_parser.add_argument("--force", action="store_true", help="Resend even if the report was already emailed")
 
     subparsers.add_parser("test-email", help="Send a test email")
+    doctor_parser = subparsers.add_parser("doctor", help="Check restart readiness without generating reports or sending email")
+    doctor_parser.add_argument("--offline", action="store_true", help="Only check local files and configuration")
 
     reminder_parser = subparsers.add_parser("send-login-reminder", help="Send the WeChat login reminder email if due")
     reminder_parser.add_argument("--force", action="store_true", help="Send even if the three-day interval has not elapsed")
@@ -73,26 +80,39 @@ def main(argv: list[str] | None = None) -> int:
     validate_parser = subparsers.add_parser("validate-accounts", help="Audit account source availability")
     validate_parser.add_argument("--theme", help="Only validate one theme id or name")
     validate_parser.add_argument("--limit", type=int, default=3, help="Recent posts to inspect per account")
+    audit_parser = subparsers.add_parser("audit-wechat", help="Audit only wechat-download-api, never count fallback sources as healthy")
+    audit_parser.add_argument("--theme", help="Only check one theme")
+    audit_parser.add_argument("--no-content", action="store_true", help="Only check identities and lists, omit article body samples")
 
     serve_reports_parser = subparsers.add_parser("serve-reports", help="Serve a local web UI for browsing generated reports")
     serve_reports_parser.add_argument("--host", default="127.0.0.1", help="Host address to bind; defaults to 127.0.0.1")
     serve_reports_parser.add_argument("--port", type=int, default=8765, help="Port to bind; defaults to 8765")
+    serve_reports_parser.add_argument("--calendar", action="store_true", help="Browse natural-day previews instead of scheduled reports")
 
     args = parser.parse_args(argv)
 
-    load_dotenv(PROJECT_ROOT / ".env")
-    settings = load_settings(PROJECT_ROOT)
-    configure_proxy_environment(settings)
-    setup_logging(PROJECT_ROOT, settings)
-
     try:
+        load_dotenv(PROJECT_ROOT / ".env")
+        settings = load_settings(PROJECT_ROOT)
+        configure_proxy_environment(settings)
+        setup_logging(PROJECT_ROOT, settings)
+        if args.command == "doctor":
+            from .diagnostics import doctor
+            return doctor(PROJECT_ROOT, settings, offline=args.offline)
         if args.command == "run":
+            if args.calendar_day:
+                settings = calendar_settings(settings)
+                return run_report(date.fromisoformat(args.calendar_day), settings, send_mail=not args.no_email,
+                                  force=args.force, theme_selector=args.theme)
             schedule_date = parse_schedule_date(args.date, settings)
             return run_report(schedule_date, settings, send_mail=not args.no_email, force=args.force, theme_selector=args.theme)
         if args.command == "catch-up":
             return catch_up(settings, send_mail=not args.no_email, theme_selector=args.theme)
         if args.command == "send-report":
-            return send_existing_report(settings, date.fromisoformat(args.date), theme_selector=args.theme)
+            if args.calendar or settings.get("report_window") == "previous_calendar_day":
+                settings = calendar_settings(settings)
+            with run_lock(resolve_project_path(PROJECT_ROOT, str(settings["lock_path"]))):
+                return send_existing_report(settings, date.fromisoformat(args.date), theme_selector=args.theme, force=args.force)
         if args.command == "test-email":
             return test_email(settings)
         if args.command == "send-login-reminder":
@@ -103,13 +123,21 @@ def main(argv: list[str] | None = None) -> int:
             return probe_justone(settings, selectors=args.account or [], limit=args.limit)
         if args.command == "validate-accounts":
             return validate_accounts(settings, theme_selector=args.theme, limit=args.limit)
+        if args.command == "audit-wechat":
+            from .wechat_audit import audit_wechat
+            return audit_wechat(PROJECT_ROOT, settings, theme_selector=args.theme, with_content=not args.no_content)
         if args.command == "serve-reports":
             from .report_viewer import serve_report_viewer
 
+            if args.calendar:
+                settings = {**settings, "reports_dir": str(Path(settings["reports_dir"]) / "calendar")}
             return serve_report_viewer(PROJECT_ROOT, settings, host=args.host, port=args.port)
     except ConfigError as exc:
         logging.error("Configuration error: %s", exc)
         return 2
+    except RunAlreadyActive:
+        logging.warning("Another run is already active; skipping.")
+        return 1 if args.command == "audit-wechat" else 0
     except Exception:
         logging.exception("Command failed")
         return 1
@@ -117,6 +145,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def setup_logging(project_root: Path, settings: dict[str, Any]) -> None:
+    from .logging_utils import RedactingFormatter
     log_dir = resolve_project_path(project_root, str(settings.get("log_dir", "logs")))
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"daily_{datetime.now().strftime('%Y-%m-%d')}.log"
@@ -127,7 +156,16 @@ def setup_logging(project_root: Path, settings: dict[str, Any]) -> None:
             logging.FileHandler(log_path, encoding="utf-8"),
             logging.StreamHandler(sys.stdout),
         ],
+        force=True,
     )
+    for handler in logging.getLogger().handlers:
+        handler.setFormatter(RedactingFormatter("%(asctime)s %(levelname)s %(message)s"))
+
+
+def calendar_settings(settings: dict[str, Any]) -> dict[str, Any]:
+    return {**settings, "calendar_day": True,
+            "reports_dir": str(Path(settings["reports_dir"]) / "calendar"),
+            "state_path": str(Path(settings["state_path"]).with_name("calendar_state.sqlite3"))}
 
 
 def configure_proxy_environment(settings: dict[str, Any]) -> None:
@@ -171,6 +209,9 @@ def run_report(
     force: bool,
     theme_selector: str | None = None,
 ) -> int:
+    if settings.get("report_window") == "previous_calendar_day" and not settings.get("calendar_day"):
+        settings = calendar_settings(settings)
+        schedule_date -= timedelta(days=1)
     state = StateStore(resolve_project_path(PROJECT_ROOT, str(settings.get("state_path", "data/state.sqlite3"))))
     lock_path = resolve_project_path(PROJECT_ROOT, str(settings.get("lock_path", "data/run.lock")))
     reports_dir = resolve_project_path(PROJECT_ROOT, str(settings.get("reports_dir", "reports")))
@@ -178,31 +219,47 @@ def run_report(
     accounts = load_accounts(PROJECT_ROOT)
 
     try:
-        with run_lock(lock_path):
+        with run_lock(lock_path), ExitStack() as resources:
             failures = 0
+            source = None
             for theme in themes:
                 if state.is_complete(schedule_date, require_email=send_mail, theme_id=theme.id) and not force:
                     logging.info("Report for %s/%s already succeeded; skipping.", schedule_date.isoformat(), theme.id)
                     continue
                 theme_accounts = [account for account in accounts if account.enabled and account.theme == theme.id]
-                state.mark_started(schedule_date, theme_id=theme.id)
                 try:
-                    markdown_path, html_path, email_sent = _generate_report(
-                        schedule_date,
-                        settings,
-                        reports_dir,
-                        send_mail,
-                        theme,
-                        theme_accounts,
-                    )
+                    generated = None if force else state.get_generated_report(schedule_date, theme.id)
+                    if generated is None:
+                        state.mark_started(schedule_date, theme_id=theme.id)
+                        if source is None and theme_accounts:
+                            source = make_source(settings)
+                            resources.callback(source.close)
+                        markdown_path, html_path, email_required = _generate_report(
+                            schedule_date, settings, reports_dir, theme, theme_accounts, source,
+                        )
+                        state.mark_generated(schedule_date, markdown_path, html_path, theme.id, email_required)
+                    else:
+                        markdown_path, html_path, email_required = generated
+                        logging.info("Reusing generated report for %s/%s", schedule_date, theme.id)
+                    email_sent = False
+                    if send_mail and email_required:
+                        send_email(email_subject(settings, theme, schedule_date),
+                                   markdown_path.read_text(encoding="utf-8"), html_path.read_text(encoding="utf-8"))
+                        email_sent = True
                     state.mark_success(schedule_date, markdown_path, html_path, email_sent, theme_id=theme.id)
                     logging.info("Report completed for %s/%s", schedule_date.isoformat(), theme.id)
                 except Exception as exc:
                     failures += 1
-                    state.mark_failed(schedule_date, str(exc), theme_id=theme.id)
+                    if state.get_generated_report(schedule_date, theme.id):
+                        state.mark_delivery_failed(schedule_date, theme.id, str(exc))
+                    else:
+                        state.mark_failed(schedule_date, str(exc), theme_id=theme.id)
                     logging.exception("Report failed for %s/%s", schedule_date.isoformat(), theme.id)
+                finally:
+                    if source is not None:
+                        source.clear_content_cache()
             return 1 if failures else 0
-    except FileExistsError:
+    except RunAlreadyActive:
         logging.warning("Another digest run is already active; skipping this trigger.")
         return 0
 
@@ -211,9 +268,9 @@ def _generate_report(
     schedule_date: date,
     settings: dict[str, Any],
     reports_dir: Path,
-    send_mail: bool,
     theme: Theme,
     accounts: list[Account],
+    source: Any,
 ) -> tuple[Path, Path, bool]:
     timezone_name = str(settings.get("timezone", "Asia/Shanghai"))
     run_time = parse_time_of_day(str(settings.get("daily_run_time", "12:00")))
@@ -223,6 +280,9 @@ def _generate_report(
         int(settings.get("lookback_hours", 24)),
         timezone_name,
     )
+    if settings.get("calendar_day"):
+        since, until = calendar_window(schedule_date, timezone_name)
+    logging.info("Collection window: %s <= publication time < %s", since.isoformat(), until.isoformat())
 
     logging.info(
         "Generating report for %s/%s with %d enabled accounts",
@@ -234,11 +294,12 @@ def _generate_report(
     issues: list[RunIssue] = []
     list_failures = 0
     metas: list[ArticleMeta] = []
-    source = make_source(settings) if accounts else None
+    coverage = []
     for account in accounts:
         try:
             assert source is not None
             account_posts = source.list_posts(account, since, until)
+            coverage.append({"account": account.name, "wxid": account.wxid, "status": "ok", "articles": len(account_posts)})
             for meta in account_posts:
                 meta.raw.setdefault("theme", theme.id)
                 if account.summary_profile:
@@ -247,307 +308,90 @@ def _generate_report(
             metas.extend(account_posts)
         except Exception as exc:
             list_failures += 1
+            coverage.append({"account": account.name, "wxid": account.wxid, "status": "failed", "error": str(exc)})
             logging.warning("Failed to list posts for %s: %s", account.name, exc)
             issues.append(RunIssue(scope="list_posts", account_name=account.name, account_wxid=account.wxid, message=str(exc)))
+
+    if source is not None:
+        issues.extend(source.drain_issues())
 
     if accounts and list_failures == len(accounts) and not metas:
         raise RuntimeError("All configured sources failed before any article was collected; not sending an empty success report.")
 
     original_count = len(metas)
     metas = limit_articles(dedupe_articles(metas), settings)
+    if source is not None:
+        source.retain_articles({meta.url for meta in metas})
     if len(metas) != original_count:
         logging.info("Selected %d of %d posts after article limits", len(metas), original_count)
+
+    if settings.get("source") == "weread" and list_failures:
+        # A list gap makes this theme undeliverable. Save the coverage evidence
+        # before any paid summaries, including on Windows failure retries.
+        from .file_utils import atomic_write_text
+        audit_path = reports_dir / schedule_date.isoformat() / f"{theme.id}.audit.json"
+        audit = {"generated_at": now_in_timezone(timezone_name).isoformat(), "source": "weread",
+                 "since": since.isoformat(), "until": until.isoformat(), "theme": theme.id,
+                 "accounts": coverage, "selected_articles": len(metas), "summarized_articles": 0,
+                 "status": "incomplete", "stopped_before_summary": True,
+                 "articles": [{"account": m.account_name, "title": m.title, "url": m.url,
+                               "published_at": m.published_at.isoformat() if m.published_at else None} for m in metas],
+                 "issues": [asdict(issue) for issue in issues], "image_selection": []}
+        atomic_write_text(audit_path, json.dumps(audit, ensure_ascii=False, indent=2))
+        raise RuntimeError(f"Incomplete WeRead account coverage; stopped before paid summaries. Audit: {audit_path}")
+
     digests: list[ArticleDigest] = []
 
     if metas:
         summarizer = Summarizer(settings)
-        article_payloads: list[tuple[ArticleMeta, ArticleContent]] = []
-        for meta in metas:
-            try:
-                assert source is not None
-                content = source.fetch_article(meta.url)
-                if not content.text.strip():
-                    raise RuntimeError("article text is empty")
-                article_payloads.append((meta, content))
-                logging.info("Fetched article content: %s", meta.title)
-            except Exception as exc:
-                logging.warning("Failed to process article %s: %s", meta.url, exc)
-                issues.append(
-                    RunIssue(
-                        scope="article",
-                        account_name=meta.account_name,
-                        account_wxid=meta.account_wxid,
-                        article_url=meta.url,
-                        message=str(exc),
-                    )
-                )
-
-        digests = summarize_payloads(article_payloads, summarizer, settings, issues)
-        overview = build_overview(digests, summarizer, settings, issues) if digests else "发现新文章，但正文获取或总结失败。"
+        digests = process_articles(metas, source, summarizer, settings, issues)
+        if not digests:
+            raise RuntimeError("All article content fetches failed; no successful report was recorded.")
+        overview = build_overview(digests, summarizer, settings, issues)
     else:
         overview = "过去 24 小时内没有发现新的文章。"
 
     markdown = build_markdown(schedule_date, since, until, overview, digests, issues, settings, theme_name=theme.name)
     html_text = build_html(schedule_date, since, until, overview, digests, issues, settings, theme_name=theme.name)
     markdown_path, html_path = write_reports(reports_dir, schedule_date, markdown, html_text, theme_id=theme.id)
+    from .file_utils import atomic_write_text
+    incomplete = any(issue.scope != "ocr" for issue in issues)
+    image_plan = report_image_plan(digests, settings)
+    audit = {"generated_at": now_in_timezone(timezone_name).isoformat(), "source": settings.get("source", "mixed"),
+             "since": since.isoformat(), "until": until.isoformat(), "theme": theme.id,
+             "accounts": coverage, "selected_articles": len(metas), "summarized_articles": len(digests),
+             "status": "incomplete" if incomplete else "complete",
+             "articles": [{"account": m.account_name, "title": m.title, "url": m.url,
+                           "published_at": m.published_at.isoformat() if m.published_at else None} for m in metas],
+             "issues": [asdict(issue) for issue in issues],
+             "image_selection": [{"article_url": digest.meta.url, **digest.content.image_selection,
+                                  "displayed_urls": image_plan.get(id(digest), [])}
+                                 for digest in digests if digest.content.image_selection]}
+    atomic_write_text(markdown_path.with_suffix(".audit.json"), json.dumps(audit, ensure_ascii=False, indent=2))
+    if settings.get("source") == "weread" and incomplete:
+        raise RuntimeError(f"Incomplete WeRead report saved at {html_path}; inspect its warnings/audit before retrying. No success or email recorded.")
 
-    email_sent = False
-    should_send = send_mail and (digests or issues or bool(settings.get("send_empty_report", True)))
-    if should_send:
-        subject = email_subject(settings, theme, schedule_date)
-        send_email(subject, markdown, html_text)
-        email_sent = True
-        logging.info("Email sent for %s/%s", schedule_date.isoformat(), theme.id)
-    else:
-        logging.info("Email sending skipped for %s/%s.", schedule_date.isoformat(), theme.id)
-
-    return markdown_path, html_path, email_sent
-
-
-def summarize_payloads(
-    article_payloads: list[tuple[ArticleMeta, ArticleContent]],
-    summarizer: Summarizer,
-    settings: dict[str, Any],
-    issues: list[RunIssue],
-) -> list[ArticleDigest]:
-    if not article_payloads:
-        return []
-
-    mode = str(settings.get("summary_mode", "batch")).lower()
-    if mode == "individual":
-        return summarize_individually(article_payloads, summarizer, settings, issues)
-
-    batch_size = max(1, int(settings.get("llm_batch_size", 6) or 6))
-    digests: list[ArticleDigest] = []
-    for chunk in chunks(article_payloads, batch_size):
-        try:
-            summaries = summarizer.summarize_articles_batch(chunk)
-            logging.info("Batch summarized %d articles", len(chunk))
-        except Exception as exc:
-            logging.warning("Batch summary failed: %s; using local fallback summaries", exc)
-            issues.append(RunIssue(scope="summary_batch", message=f"批量摘要失败，已使用本地兜底摘要：{exc}"))
-            summaries = [fallback_summary(meta, content) for meta, content in chunk]
-
-        for (meta, content), summary in zip(chunk, summaries):
-            digests.append(ArticleDigest(meta=meta, content=content, summary=summary))
-            logging.info("Summarized article: %s", meta.title)
-    return digests
+    email_required = bool(digests or issues or settings.get("send_empty_report", True))
+    return markdown_path, html_path, email_required
 
 
-def summarize_individually(
-    article_payloads: list[tuple[ArticleMeta, ArticleContent]],
-    summarizer: Summarizer,
-    settings: dict[str, Any],
-    issues: list[RunIssue],
-) -> list[ArticleDigest]:
-    workers = max(1, int(settings.get("llm_parallel_workers", 1) or 1))
-    if workers == 1 or len(article_payloads) <= 1:
-        return [summarize_one_article(meta, content, summarizer, issues) for meta, content in article_payloads]
-
-    digests: list[ArticleDigest | None] = [None] * len(article_payloads)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(workers, len(article_payloads))) as executor:
-        future_to_index = {
-            executor.submit(summarize_one_article, meta, content, summarizer, issues): index
-            for index, (meta, content) in enumerate(article_payloads)
-        }
-        for future in concurrent.futures.as_completed(future_to_index):
-            index = future_to_index[future]
-            digests[index] = future.result()
-    return [digest for digest in digests if digest is not None]
-
-
-def summarize_one_article(
-    meta: ArticleMeta,
-    content: ArticleContent,
-    summarizer: Summarizer,
-    issues: list[RunIssue],
-) -> ArticleDigest:
-    try:
-        summary = summarizer.summarize_article(meta, content)
-    except Exception as exc:
-        logging.warning("Individual summary failed for %s: %s; using local fallback", meta.url, exc)
-        issues.append(
-            RunIssue(
-                scope="summary",
-                account_name=meta.account_name,
-                account_wxid=meta.account_wxid,
-                article_url=meta.url,
-                message=f"单篇摘要失败，已使用本地兜底摘要：{exc}",
-            )
-        )
-        summary = fallback_summary(meta, content)
-    logging.info("Summarized article: %s", meta.title)
-    return ArticleDigest(meta=meta, content=content, summary=summary)
-
-
-def summarize_overview(digests: list[ArticleDigest], summarizer: Summarizer, issues: list[RunIssue]) -> str:
-    try:
-        return summarizer.summarize_overview([digest.summary for digest in digests])
-    except Exception as exc:
-        logging.warning("Overview summary failed: %s; using local fallback overview", exc)
-        issues.append(RunIssue(scope="overview", message=f"总览摘要失败，已使用本地兜底总览：{exc}"))
-        return fallback_overview(digests)
-
-
-def build_overview(
-    digests: list[ArticleDigest],
-    summarizer: Summarizer,
-    settings: dict[str, Any],
-    issues: list[RunIssue],
-) -> str:
-    mode = str(settings.get("overview_mode", "factual")).lower()
-    if mode == "llm":
-        return summarize_overview(digests, summarizer, issues)
-    return factual_overview(digests)
-
-
-def factual_overview(digests: list[ArticleDigest]) -> str:
-    accounts: dict[str, int] = {}
-    for digest in digests:
-        name = digest.meta.account_name or digest.meta.account_wxid or "未知公众号"
-        accounts[name] = accounts.get(name, 0) + 1
-    account_text = "、".join(f"{name} {count} 篇" for name, count in accounts.items())
-    return f"本期共收录 {len(digests)} 篇文章，来源包括：{account_text}。下文按公众号分组，每篇推文均单独获取正文并独立生成摘要。"
-
-
-def chunks(items: list[tuple[ArticleMeta, ArticleContent]], size: int) -> list[list[tuple[ArticleMeta, ArticleContent]]]:
-    return [items[index : index + size] for index in range(0, len(items), size)]
-
-
-def fallback_summary(meta: ArticleMeta, content: ArticleContent) -> str:
-    text = " ".join((content.text or meta.brief or "").split())
-    published = meta.published_at.strftime("%Y-%m-%d %H:%M") if meta.published_at else "未知"
-    if looks_like_list_article(meta, content):
-        points = list_like_points(content.text or meta.brief or "", max_points=8)
-        if points:
-            return "\n".join(
-                [
-                    f"一句话结论：这是一篇条目型信息汇总，收录了 {len(points)} 条主要信息。",
-                    "",
-                    "分条摘要：",
-                    *[f"- {point}" for point in points],
-                    "",
-                    f"来源：{meta.account_name}，发布时间：{published}，链接：{meta.url}",
-                ]
-            )
-
-    conclusion = first_sentences(text, max_sentences=1, max_chars=160) or meta.title
-    core = first_sentences(text, max_sentences=3, max_chars=380) or meta.brief or meta.title
-    return "\n".join(
-        [
-            f"一句话结论：{conclusion}",
-            "",
-            "要点：",
-            f"- 来源：{meta.account_name}，发布时间：{published}。",
-            f"- 核心内容：{core}",
-            f"- 原文链接：{meta.url}",
-        ]
-    )
-
-
-def fallback_overview(digests: list[ArticleDigest]) -> str:
-    accounts = sorted({digest.meta.account_name for digest in digests})
-    titles = "；".join(digest.meta.title for digest in digests[:5])
-    return (
-        f"本期共抓取并整理 {len(digests)} 篇文章，来源包括{'、'.join(accounts)}。"
-        f"重点内容集中在这些文章：{titles}。"
-        "部分模型摘要步骤未完成时，系统已使用本地兜底摘要保证日报可以生成和发送。"
-    )
-
-
-def first_sentences(text: str, max_sentences: int, max_chars: int) -> str:
-    if not text:
-        return ""
-    sentences = [part.strip() for part in re.split(r"(?<=[。！？.!?])\s*", text) if part.strip()]
-    if not sentences:
-        return text[:max_chars].strip()
-    result = "".join(sentences[:max_sentences]).strip()
-    return result[:max_chars].strip()
-
-
-def looks_like_list_article(meta: ArticleMeta, content: ArticleContent) -> bool:
-    configured = str(meta.raw.get("summary_profile") or "").lower()
-    if configured == "list_digest":
-        return True
-    title = meta.title or ""
-    if re.search(r"(情报|日报|周报|月报|合集|汇总|通知|活动|招聘|日历|清单|速递|简讯|资讯)", title):
-        return True
-    lines = [line.strip() for line in (content.text or "").splitlines() if line.strip()]
-    bullet_count = sum(
-        1
-        for line in lines
-        if re.match(r"^([-*•·]|[0-9一二三四五六七八九十]+[.、）)]|[（(][0-9一二三四五六七八九十]+[）)])", line)
-    )
-    return bullet_count >= 5
-
-
-def list_like_points(text: str, max_points: int) -> list[str]:
-    lines = [line.strip(" -•·\t") for line in text.splitlines() if line.strip()]
-    points: list[str] = []
-    for line in lines:
-        cleaned = re.sub(r"^[0-9一二三四五六七八九十]+[.、）)]\s*", "", line).strip()
-        if 12 <= len(cleaned) <= 180 and cleaned not in points:
-            points.append(cleaned)
-        if len(points) >= max_points:
-            break
-    return points
-
-
-def dedupe_articles(metas: list[ArticleMeta]) -> list[ArticleMeta]:
-    seen: set[str] = set()
-    result: list[ArticleMeta] = []
-    for meta in sorted(metas, key=article_timestamp):
-        keys = article_dedupe_keys(meta)
-        if any(key in seen for key in keys):
-            continue
-        seen.update(keys)
-        result.append(meta)
-    return result
-
-
-def article_dedupe_keys(meta: ArticleMeta) -> set[str]:
-    keys = {meta.url.split("#", 1)[0]}
-    normalized_title = re.sub(r"\s+", "", meta.title or "").lower()
-    account = meta.account_wxid or meta.account_name or ""
-    if normalized_title and account and meta.published_at:
-        keys.add(f"{account}|{normalized_title}|{meta.published_at.strftime('%Y-%m-%d %H:%M')}")
-    return keys
-
-
-def limit_articles(metas: list[ArticleMeta], settings: dict[str, Any]) -> list[ArticleMeta]:
-    per_account = int(settings.get("max_articles_per_account", 0) or 0)
-    total = int(settings.get("max_total_articles", 0) or 0)
-    if per_account <= 0 and total <= 0:
-        return metas
-
-    counts: dict[str, int] = {}
-    selected: list[ArticleMeta] = []
-    for meta in sorted(metas, key=article_timestamp, reverse=True):
-        account_key = meta.account_wxid or meta.account_name
-        if per_account > 0 and counts.get(account_key, 0) >= per_account:
-            continue
-        selected.append(meta)
-        counts[account_key] = counts.get(account_key, 0) + 1
-        if total > 0 and len(selected) >= total:
-            break
-    return sorted(selected, key=article_timestamp)
-
-
-def article_timestamp(meta: ArticleMeta) -> float:
-    if not meta.published_at:
-        return 0.0
-    return meta.published_at.timestamp()
-
-
-def send_existing_report(settings: dict[str, Any], schedule_date: date, theme_selector: str | None = None) -> int:
+def send_existing_report(settings: dict[str, Any], schedule_date: date, theme_selector: str | None = None, force: bool = False) -> int:
     reports_dir = resolve_project_path(PROJECT_ROOT, str(settings.get("reports_dir", "reports")))
     state = StateStore(resolve_project_path(PROJECT_ROOT, str(settings.get("state_path", "data/state.sqlite3"))))
     failures = 0
     for theme in select_themes(theme_selector, enabled_only=True):
+        if not force and state.is_complete(schedule_date, require_email=True, theme_id=theme.id):
+            logging.info("Existing report %s/%s already emailed; skipping", schedule_date, theme.id)
+            continue
         markdown_path = reports_dir / schedule_date.isoformat() / f"{theme.id}.md"
         html_path = reports_dir / schedule_date.isoformat() / f"{theme.id}.html"
         if not markdown_path.exists() or not html_path.exists():
             logging.warning("Report files for %s/%s were not found in %s", schedule_date.isoformat(), theme.id, reports_dir)
+            failures += 1
+            continue
+        audit_path = markdown_path.with_suffix(".audit.json")
+        if audit_path.exists() and json.loads(audit_path.read_text(encoding="utf-8")).get("status") != "complete":
+            logging.error("Incomplete report %s/%s was not emailed", schedule_date, theme.id)
             failures += 1
             continue
         send_email(
@@ -572,12 +416,24 @@ def test_email(settings: dict[str, Any]) -> int:
 
 
 def send_login_reminder(settings: dict[str, Any], force: bool = False, dry_run: bool = False) -> int:
+    if dry_run:
+        return _send_login_reminder(settings, force, dry_run=True)
+    lock_path = resolve_project_path(PROJECT_ROOT, str(settings["lock_path"])).with_name("reminder.lock")
+    with run_lock(lock_path):
+        return _send_login_reminder(settings, force, dry_run=False)
+
+
+def _send_login_reminder(settings: dict[str, Any], force: bool, dry_run: bool) -> int:
+    if settings.get("source") == "weread":
+        logging.info("WeRead renews sessions on demand; the legacy scheduled QR reminder is disabled.")
+        return 0
     timezone_name = str(settings.get("timezone", "Asia/Shanghai"))
     now = now_in_timezone(timezone_name)
     interval_days = max(1, int(settings.get("login_reminder_interval_days", 3) or 3))
-    state = StateStore(resolve_project_path(PROJECT_ROOT, str(settings.get("state_path", "data/state.sqlite3"))))
+    state_path = resolve_project_path(PROJECT_ROOT, str(settings.get("state_path", "data/state.sqlite3")))
+    state = StateStore(state_path, read_only=dry_run) if state_path.exists() or not dry_run else None
     reminder_key = "wechat_download_api_login"
-    last_sent_at = state.get_reminder_sent_at(reminder_key)
+    last_sent_at = state.get_reminder_sent_at(reminder_key) if state is not None else None
     if last_sent_at and last_sent_at.tzinfo is None:
         last_sent_at = last_sent_at.replace(tzinfo=now.tzinfo)
 
@@ -609,6 +465,7 @@ def send_login_reminder(settings: dict[str, Any], force: bool = False, dry_run: 
         return 0
 
     send_email(subject, text, html)
+    assert state is not None
     state.mark_reminder_sent(reminder_key, now)
     print("WeChat login reminder email sent.")
     logging.info("WeChat login reminder email sent.")
@@ -630,6 +487,8 @@ def check_source(
     run_time = parse_time_of_day(str(settings.get("daily_run_time", "12:00")))
     schedule_date = latest_due_schedule_date(now_in_timezone(timezone_name), run_time)
     since, until = scheduled_window(schedule_date, run_time, int(settings.get("lookback_hours", 24)), timezone_name)
+    if settings.get("report_window") == "previous_calendar_day":
+        since, until = calendar_window(schedule_date - timedelta(days=1), timezone_name)
 
     source = make_source(settings)
     if recent:
@@ -668,6 +527,10 @@ def probe_justone(settings: dict[str, Any], selectors: list[str], limit: int = 3
         timeout_seconds=int(settings.get("source_timeout_seconds", 60)),
         retries=int(settings.get("source_retries", 2)),
         timezone_name=str(settings.get("timezone", "Asia/Shanghai")),
+        account_cache_path=resolve_project_path(PROJECT_ROOT, str(settings.get("justone", {}).get("account_cache_path", "data/justone_accounts.json"))),
+        identity_cache_path=resolve_project_path(PROJECT_ROOT, str(settings.get("wechat_download_api", {}).get("account_cache_path", "data/wechat_download_api_accounts.json"))),
+        max_pages=int(settings.get("justone", {}).get("max_pages", 5)),
+        request_interval_seconds=float(settings.get("justone", {}).get("request_interval_seconds", 2.0)),
     )
 
     usable = 0
@@ -677,12 +540,14 @@ def probe_justone(settings: dict[str, Any], selectors: list[str], limit: int = 3
             posts = source.list_recent_posts(account, limit=limit)
             first = posts[0] if posts else None
             content_ok = False
+            content_error = ""
             if first:
                 try:
                     content = source.fetch_article(first.url)
                     content_ok = bool(content.text.strip())
-                except Exception:
+                except Exception as exc:
                     content_ok = False
+                    content_error = str(exc)
             if posts and content_ok:
                 usable += 1
             results.append(
@@ -691,22 +556,26 @@ def probe_justone(settings: dict[str, Any], selectors: list[str], limit: int = 3
                     "wxid": account.wxid,
                     "posts": len(posts),
                     "content_ok": content_ok,
+                    "content_error": content_error,
                     "first_title": first.title if first else "",
                 }
             )
         except Exception as exc:
             results.append({"account": account.name, "wxid": account.wxid, "error": str(exc)})
+        print(json.dumps(results[-1], ensure_ascii=False), flush=True)
+        if source._blocked_error:
+            break
 
-    for result in results:
-        print(json.dumps(result, ensure_ascii=False))
-
-    if usable:
+    if source._blocked_error:
+        mark_source_unhealthy("justone", settings, source._blocked_error)
+        print("Just One quota/authentication restriction: remaining requests stopped.")
+    elif usable:
         mark_source_healthy("justone", settings, f"usable accounts: {usable}/{len(targets)}")
         print(f"Just One probe passed: {usable}/{len(targets)} accounts returned usable posts.")
     else:
         mark_source_unhealthy("justone", settings, "no probed accounts returned usable posts with article content")
         print("Just One probe failed: marked Just One unhealthy, daily runs will skip it until the health cache expires.")
-    return 0
+    return 0 if usable and not source._blocked_error else 1
 
 
 def validate_accounts(settings: dict[str, Any], theme_selector: str | None = None, limit: int = 3) -> int:
@@ -850,13 +719,7 @@ def stable_sources_for_account(account: Account) -> list[str]:
 
 
 def default_justone_probe_accounts(accounts: list[Account]) -> list[Account]:
-    result: list[Account] = []
-    for account in accounts:
-        if account not in result:
-            result.append(account)
-        if len(result) >= 5:
-            break
-    return result
+    return [account for account in accounts if account.enabled][:5]
 
 
 def select_themes(theme_selector: str | None, enabled_only: bool) -> list[Theme]:

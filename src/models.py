@@ -48,6 +48,7 @@ class ArticleContent:
     text: str = ""
     image_urls: list[str] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
+    image_selection: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

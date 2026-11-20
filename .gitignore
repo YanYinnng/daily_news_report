@@ -1,4 +1,10 @@
 .env
+.env.*
+!.env.example
+/config/accounts.yaml
+/config/themes.yaml
+/config/public_feeds.json
+project-root.txt
 .venv/
 __pycache__/
 *.pyc

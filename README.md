@@ -1,294 +1,142 @@
-# 微信公众号多主题每日摘要
+# 微信公众号搜索与多主题日报 · v3.0
 
-新对话中的 Codex 接手时，建议先读 `HANDOFF.md`，再读本 README。`HANDOFF.md` 记录通用维护建议；本 README 记录长期维护方法。
+在 Windows 本机通过微信读书获取公众号近期文章与正文，支持公开微信文章直读、本地 OCR、分主题摘要、HTML/Markdown 日报、报告网页与邮件投递。提供独立的 Codex skill，可从其他聊天按需使用同一套读取能力。
 
-这个项目每天北京时间 12:00 汇总启用主题下各公众号在前 24 小时内的新文章，按主题分别生成 Markdown/HTML 日报，并按主题分别发送邮件。电脑 12:00 未运行时，会在下次开机或登录后执行 `catch-up` 补跑缺失主题。
+本项目仅发布程序、测试和空白配置模板，不分发账号清单、登录会话、API 密钥、邮箱配置、日报或日志。
 
-## 当前状态
+## v3.0 更新
 
-- 公众号配置：`config/accounts.yaml`，请在本地配置自己的公众号。
-- 主题配置：`config/themes.yaml`，请在本地配置自己的主题。
-- 报告模式：每个主题一份报告，每篇推文单独总结。
-- 邮件模式：每个主题一封邮件，标题包含主题名和日期。
-- 数据源顺序：`wechat-download-api` 优先；账号显式配置的稳定渠道只在主链路没拿到文章时兜底，再由 Just One、opencli 兜底。
-- 自动任务：Windows 任务计划程序每天 12:00 运行，错过后通过登录/启动补跑。
-- 本地浏览：`serve-reports` 可在 `http://127.0.0.1:8765` 查看历史日报，兼容多主题目录和旧版扁平报告。
+- 微信读书成为默认来源，支持正常会话续期、账号身份校验、按推送组分页、访问受限时停止请求。
+- 新增 `$wechat-public-articles` skill 和 `src.article_reader` 按需读取入口，不调用日报模型或邮件。
+- 支持图片正文的 Windows 本地 OCR、长图分段识别、图文补读及日报图片筛选。
+- 日报默认统计前一自然日，支持报告覆盖审计、失败补跑和成功投递后停止当天后续检查。
+- 重组源码、操作脚本、诊断工具和文档，新增离线回归测试。
 
-## 项目结构
+完整变更见 [CHANGELOG](CHANGELOG.md)。
+
+## 1. 安装与配置
+
+推荐 Windows 10/11、Python 3.12、PowerShell。微信读书路线不需要 Docker。
+
+```powershell
+git clone https://github.com/YanYinnng/daily_news_report.git
+cd daily_news_report
+.\scripts\setup.ps1
+```
+
+安装器创建 `.venv`、安装锁定依赖，并在缺失时从模板生成本地配置。已有文件不会被覆盖。升级 v2.0 时请先备份自己的账号、主题及 `.env`；v3.0 将实际个人配置与公开模板分开。
+
+| 公开模板/配置 | 用途 |
+|---|---|
+| [`config/accounts.example.yaml`](config/accounts.example.yaml) | 公众号示例：名称、微信号、主题、公众号身份；复制成 `config/accounts.yaml` 后填写 |
+| [`config/themes.example.yaml`](config/themes.example.yaml) | 分类示例；实际填写 `config/themes.yaml` |
+| [`config/settings.yaml`](config/settings.yaml) | 通用来源、限速、运行时间、摘要和图片设置 |
+| [`.env.example`](.env.example) | `LLM_*` 与 `SMTP_*`/`MAIL_*` 配置模板；实际填写 `.env` |
+
+新安装的示例账号和主题默认禁用。需要读取指定公众号时，从其已核对的公开原文长链接获取 `__biz`，将该值填写到对应账号的 `wechat_fakeid`；启用真实配置后的主题与账号。另一种方式是将已经核对的身份保存在本机 `data/wechat_download_api_accounts.json`。首次安装空白身份缓存会由 setup 创建。不要根据同名账号猜测身份。
+
+```powershell
+# 只读本地检查，不请求公众号、模型或邮件
+.\.venv\Scripts\python.exe -B -m src.main doctor --offline
+# 首次登录；如有已启用的账号会检查一个，否则仅登录
+.\.venv\Scripts\python.exe -B -m src.article_reader login
+```
+
+扫码得到的新会话只保存在本机 `data/`。看到登录成功后，还要实读列表和正文确认文章权限。
+
+## 2. 按需查询与 Codex skill
+
+```powershell
+.\scripts\install_skill.ps1
+```
+
+在本机 Codex 中说：
+
+> 使用 `$wechat-public-articles` 搜索指定公众号近期与 AI Agent 有关的文章，读原文并整理。
+
+也可从项目根目录直接运行：
+
+```powershell
+$Python = '.\.venv\Scripts\python.exe'
+& $Python -B -m src.article_reader status
+& $Python -B -m src.article_reader accounts '公众号名称'
+& $Python -B -m src.article_reader recent '公众号名称' --limit 3
+# 将变量替换为已核对的公开文章地址，或 recent 返回的微信读书地址
+& $Python -B -m src.article_reader read $ArticleUrl
+# 公开图文文章需要补读海报等图中文字时
+& $Python -B -m src.article_reader read $PublicArticleUrl --include-images
+# 非配置内公众号：提供该号已核对、带 __biz 的原文长链接
+& $Python -B -m src.article_reader recent $AccountName --source-url $VerifiedArticleUrl --limit 3
+```
+
+技能可以用公开索引按主题、标题寻找文章，再获取目标正文；`recent` 按账号读列表，不是全平台关键词搜索。不承诺覆盖未群发、已删除、付费或受限文章。纯图 OCR 会标明未人工核验。
+
+如果 `-2012` 正常续期失败，请重新扫码；如果 `-2041` 或出现阅读授权、安全验证，应先停止请求，在手机微信读书的“书架 → 文章收藏”点击某个公众号名称，按实际提示操作并确认多篇文章列表可见，待本地保护期结束后再有限复查。详见[使用与排错](docs/OPERATIONS.md)及 [skill](skills/wechat-public-articles/SKILL.md)。
+
+## 3. 日报与本机查看
+
+需要自行配置启用的主题和账号、模型 API（可能产生模型费用），如需邮件再配置 SMTP。先按明确日期生成单主题本地报告；`--no-email` 禁止投递，但不会禁用摘要模型。
+
+```powershell
+# 明确某一天的文章窗口；示例日期请自行替换
+.\.venv\Scripts\python.exe -B -m src.main run --calendar-day 2026-01-01 --theme ai --no-email
+# 生成并发送全部启用主题的报告（省略 --no-email）
+.\.venv\Scripts\python.exe -B -m src.main run --calendar-day 2026-01-01
+# 只补发已生成报告，不重新摘要
+.\.venv\Scripts\python.exe -B -m src.main send-report --date 2026-01-01 --calendar
+```
+
+自然日报告输出 `reports/calendar/YYYY-MM-DD/<theme>.md`、`.html`、`.audit.json`，SQLite 分别记录生成和投递状态。账号列表覆盖不完整时停止该主题摘要；正文或摘要失败时不发送不完整日报。
+
+```powershell
+.\scripts\start_project.ps1
+# 停止查看服务
+.\scripts\stop_project.ps1
+```
+
+本机报告查看：[http://127.0.0.1:8765/](http://127.0.0.1:8765/)。支持分类与日期切换，图片点击放大、原图及长图滚动。默认每篇最多 3 张附图、每个分类最多 30 张，使用本地 OCR 和图像特征筛选。
+
+## 4. Windows 自动任务（可选）
+
+默认不自动注册任务。完成手动验收后，按需执行：
+
+```powershell
+.\scripts\install_task.ps1 -TaskName WeChatDailyDigestNoon
+# 只读检查
+Get-ScheduledTask -TaskName WeChatDailyDigestNoon
+# 暂停
+Disable-ScheduledTask -TaskName WeChatDailyDigestNoon
+Stop-ScheduledTask -TaskName WeChatDailyDigestNoon
+```
+
+任务默认 08:00 汇总前一天 00:00 至次日 00:00；当天尚未完成时 10:00—20:00 每两小时补跑，成功发送后移到次日，不唤醒电脑或阻止休眠，登录或恢复后补最近应执行日。任务名称沿用旧版本。
+
+## 5. 目录结构
 
 ```text
-config/
-  accounts.yaml       公众号清单
-  settings.yaml       全局运行设置
-  themes.yaml         主题开关和邮件标题前缀
-scripts/
-  setup.ps1           创建虚拟环境并安装依赖
-  install_task.ps1    安装 Windows 自动任务
-  run_daily.ps1       自动任务实际调用入口
-  setup_wechat_download_api.ps1  准备本地 wechat-download-api 服务
-src/
-  main.py             CLI 入口
-  report.py           Markdown/HTML 报告生成
-  report_viewer.py    本地日报浏览网页和 API
-  summarizer.py       LLM 摘要
-  mailer.py           邮件发送
-  source_health.py    数据源健康缓存
-  sources/            数据源适配器
-data/                 运行状态、来源审计、健康缓存
-logs/                 日常任务日志
-reports/              每日生成的报告
+src/                        核心业务逻辑
+  article_reader.py         按需查询
+  main.py                   日报 CLI
+  task_runner.py            Windows 任务包装
+  sources/                  来源适配器
+  image_*.py                OCR 与图片筛选
+  report*.py                报告及本地查看
+config/                     通用配置和空白个人配置模板
+skills/                     可安装的 Codex 技能
+scripts/                    操作入口，legacy/、maintenance/ 分组
+tests/                      离线回归测试
+docs/                       操作与架构文档
+data/, logs/, reports/      本机运行时生成，Git 忽略
 ```
 
-`data/`、`logs/`、`reports/`、`.env`、`.venv/` 和导入用的 Excel 文件不会提交到 Git。
-
-## 首次安装
+## 6. 验证与贡献
 
 ```powershell
-Set-Location "<项目目录>"
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup.ps1
+.\.venv\Scripts\python.exe -B -m unittest discover -s tests -q
 ```
 
-然后复制 `.env.example` 为 `.env`，填入密钥和邮箱配置：
-
-```text
-JUSTONE_API_TOKEN=
-LLM_BASE_URL=
-LLM_API_KEY=
-LLM_MODEL=
-SMTP_HOST=
-SMTP_PORT=465
-SMTP_USERNAME=
-SMTP_PASSWORD=
-MAIL_FROM=
-MAIL_TO=
-```
-
-`MAIL_TO` 只发给自己时填一个邮箱即可；多个收件人用英文逗号分隔。
-
-## 常用命令
-
-所有命令都在 `项目根目录` 下执行：
-
-```powershell
-.\.venv\Scripts\python.exe -B -m src.main run --no-email
-.\.venv\Scripts\python.exe -B -m src.main run --no-email --theme ai
-.\.venv\Scripts\python.exe -B -m src.main run
-.\.venv\Scripts\python.exe -B -m src.main catch-up
-.\.venv\Scripts\python.exe -B -m src.main send-report --date 2026-06-03 --theme ai
-.\.venv\Scripts\python.exe -B -m src.main test-email
-.\.venv\Scripts\python.exe -B -m src.main send-login-reminder --dry-run
-.\.venv\Scripts\python.exe -B -m src.main check-source --account 示例公众号
-.\.venv\Scripts\python.exe -B -m src.main check-source --account 示例公众号 --recent
-.\.venv\Scripts\python.exe -B -m src.main probe-justone
-.\.venv\Scripts\python.exe -B -m src.main validate-accounts
-.\.venv\Scripts\python.exe -B -m src.main serve-reports --host 127.0.0.1 --port 8765
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup_wechat_download_api.ps1
-```
-
-`run --no-email` 只生成文件，不发邮件。`run` 会生成并发送所有启用主题。`catch-up` 只补跑还没成功生成/发送的主题。
-
-## 本地报告浏览器
-
-这个网页只绑定本机地址，不申请 HTTPS，默认入口：
-
-```text
-http://127.0.0.1:8765
-```
-
-前台运行，窗口保持打开时服务保持运行，按 `Ctrl+C` 停止：
-
-```powershell
-.\.venv\Scripts\python.exe -B -m src.main serve-reports --host 127.0.0.1 --port 8765
-```
-
-后台运行：
-
-```powershell
-$p = Start-Process -FilePath .\.venv\Scripts\python.exe -ArgumentList "-B","-m","src.main","serve-reports","--host","127.0.0.1","--port","8765" -WorkingDirectory (Get-Location) -PassThru -WindowStyle Hidden
-$p.Id
-```
-
-查看是否正在运行：
-
-```powershell
-Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort 8765 -State Listen
-```
-
-关闭后台进程：
-
-```powershell
-$conn = Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort 8765 -State Listen
-Stop-Process -Id $conn.OwningProcess
-```
-
-如果启动时提示端口被占用，可以把 `--port 8765` 换成其他端口。网页接口包括：
-
-```text
-/api/reports
-/api/report?date=YYYY-MM-DD&theme=<theme_id>&format=html
-/api/report?date=YYYY-MM-DD&theme=<theme_id>&format=md
-```
-
-新版报告读取 `reports/YYYY-MM-DD/<theme>.html`；旧版 `reports/YYYY-MM-DD.html` 会显示为“全部主题（旧版）”。
-
-## 自动任务
-
-安装或重装自动任务：
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install_task.ps1 -TaskName WeChatDailyDigest -IncludeStartupTrigger
-```
-
-如果 Windows 不允许注册完整的登录/启动触发器，脚本会退化为：
-
-- `WeChatDailyDigestNoon`：每天 12:00 运行。
-- 启动文件夹中的 `WeChatDailyDigestCatchUp.cmd`：登录后补跑错过的日报。
-
-检查任务状态：
-
-```powershell
-schtasks /Query /TN WeChatDailyDigestNoon /V /FO LIST
-```
-
-自动任务调用的是 `scripts/run_daily.ps1`，该脚本会写入 `logs/task_YYYY-MM-DD.log`。
-
-## 配置说明
-
-`config/themes.yaml` 控制主题是否生成。把某个主题的 `enabled` 改成 `false` 后，该主题不会生成报告，也不会发邮件。
-
-`config/accounts.yaml` 控制公众号。新增公众号时至少填写：
-
-```yaml
-- name: 示例公众号
-  wxid: example_wxid
-  theme: ai
-  enabled: true
-  opencli_query: 示例公众号
-  wechat_fakeid: ""
-```
-
-如果有稳定渠道，优先补充 `rss_url`、`wordpress_api_url` 或 `article_library_api_url`。数据源优先级由代码中的全局混合数据源策略控制，不在单个账号里单独配置。
-
-`config/settings.yaml` 里常用设置：
-
-```yaml
-daily_run_time: "12:00"
-lookback_hours: 24
-summary_mode: individual
-send_empty_report: true
-include_images: auto
-max_images_per_article: 2
-max_total_images_per_theme: 20
-opencli_verify_candidates: true
-opencli_max_opened_candidates_per_account: 3
-login_reminder_interval_days: 3
-wechat_download_api:
-  enabled: true
-  base_url: "http://localhost:5000"
-  account_cache_path: data/wechat_download_api_accounts.json
-  search_count: 5
-  articles_page_size: 50
-  max_pages: 3
-  fetch_full_content: true
-  request_interval_seconds: 1.5
-  article_fetch_interval_seconds: 3.0
-  freq_control_sleep_seconds: 75
-  freq_control_retries: 1
-```
-
-## 数据源策略
-
-运行时按这个顺序采集：
-
-1. `wechat-download-api`：通过微信公众号后台登录态按 `fakeid` 拉取公众号文章列表，并按 12:00-12:00 日报窗口过滤。
-2. 稳定渠道：WordPress API、文章库 API、RSS；只对账号里显式配置了对应 URL 的公众号生效，作为主链路没拿到文章时的兜底，不视为公众号全集镜像。
-3. Just One：只有 `config/settings.yaml` 中启用且 `data/source_health.json` 没有临时禁用时才使用。
-4. opencli 微信搜索：最后兜底，会打开候选微信原文页，核验公众号名和发布时间后才收录。
-
-`probe-justone` 如果发现 Just One 不可用，会把状态写入 `data/source_health.json`，在缓存期内跳过 Just One，避免空跑和扣费。
-
-### wechat-download-api 接入
-
-参考实现来自 [adennng/wechat-query-skill](https://github.com/adennng/wechat-query-skill)。它内置的 `wechat-download-api` 需要本地 Docker 部署，并用公众号管理员微信扫码登录微信公众平台。登录后可调用 `GET /api/public/searchbiz` 搜索公众号并获取 `fakeid`，再调用 `GET /api/public/articles` 按公众号拉取文章列表。
-
-本项目只接入它的 HTTP API，不复制服务源码。准备服务：
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup_wechat_download_api.ps1
-```
-
-脚本完成后访问 `http://localhost:5000/login.html` 扫码。确认登录成功后，运行：
-
-```powershell
-.\.venv\Scripts\python.exe -B -m src.main validate-accounts --limit 3
-```
-
-如果某些账号无法自动匹配，可在 `config/accounts.yaml` 对应账号下补 `wechat_fakeid`。`data/wechat_download_api_accounts.json` 会缓存已匹配的 `fakeid`，属于运行数据，不提交 Git。
-
-### 登录提醒邮件
-
-`scripts/run_daily.ps1` 会在每日 `catch-up` 后调用：
-
-```powershell
-.\.venv\Scripts\python.exe -B -m src.main send-login-reminder
-```
-
-该命令使用 `data/state.sqlite3` 记录上次提醒时间，满 `login_reminder_interval_days` 天才发送一次。当前配置为每 3 天提醒一次。邮件标题和正文写死在 `src/main.py` 中，用于提醒打开 `http://localhost:5000/login.html` 扫码登录。
-
-验证脚本但不发邮件：
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run_daily.ps1 -SkipCatchUp -ReminderDryRun
-```
-
-## 报告和审计
-
-多主题报告保存在：
-
-```text
-reports/YYYY-MM-DD/<theme_id>.md
-reports/YYYY-MM-DD/<theme_id>.html
-```
-
-旧版历史报告仍保留在：
-
-```text
-reports/YYYY-MM-DD.md
-reports/YYYY-MM-DD.html
-```
-
-来源审计保存在：
-
-```text
-data/source_audit.json
-data/source_audit.md
-```
-
-运行状态保存在：
-
-```text
-data/state.sqlite3
-```
-
-如果某天日报异常，优先看：
-
-```text
-logs/task_YYYY-MM-DD.log
-logs/daily_YYYY-MM-DD.log
-data/source_audit.md
-data/source_health.json
-```
-
-## 维护建议
-
-- 新增公众号后，先跑 `validate-accounts --theme <theme_id>` 或 `check-source --account 示例公众号 --recent`。
-- 启用 `wechat-download-api` 后，优先看 `validate-accounts` 输出中 “微信后台 API 精确来源” 的账号数量。
-- 改主题开关后，先跑 `run --no-email --theme <theme_id>` 预览。
-- 改本地报告浏览器后，先跑 `serve-reports` 并检查 `/api/reports` 和一个具体 `/api/report`。
-- 正式发邮件前，先跑 `test-email`。
-- opencli 兜底源比较慢，公众号很多时不要随意调大 `opencli_max_opened_candidates_per_account`。
-- 导入 Excel 只用于生成配置，运行时以 `config/accounts.yaml` 为准。
-
-## 隐私说明
-
-仓库中的公众号与主题配置均为占位示例。请在本地填写自己的配置，不要提交真实账号清单、邮件地址或凭据。
+测试使用离线样本和替身，不请求真实公众号、模型或邮件。提交变更前检查 Git 暂存文件，切勿提交 `.env`、真实 `accounts.yaml`、`themes.yaml`、会话及身份缓存、截图、个人文件或运行数据。仅在有权访问文章且遵守平台提示和使用范围时使用本工具。
+
+- [运行、登录与故障排查](docs/OPERATIONS.md)
+- [架构与模块索引](docs/ARCHITECTURE.md)
+- [Codex skill 使用说明](skills/wechat-public-articles/SKILL.md)

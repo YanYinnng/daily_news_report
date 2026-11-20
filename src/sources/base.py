@@ -10,6 +10,10 @@ class SourceError(RuntimeError):
     pass
 
 
+class SourceRateLimited(SourceError):
+    """Shared upstream quota/cooldown; do not retry each account separately."""
+
+
 class WeChatSource(Protocol):
     def list_posts(self, account: Account, since: datetime, until: datetime) -> list[ArticleMeta]:
         ...

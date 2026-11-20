@@ -1,0 +1,12 @@
+# Core versions verified on 2026-09-15; image-analysis dependencies on 2026-10-16.
+requests==2.34.2
+PyYAML==6.0.3
+tzdata==2026.2
+truststore==0.10.4
+certifi==2026.5.20
+charset-normalizer==3.4.7
+idna==3.16
+urllib3==2.7.0
+Pillow==12.3.0
+opencv-python-headless==5.0.0.93
+numpy==2.5.4

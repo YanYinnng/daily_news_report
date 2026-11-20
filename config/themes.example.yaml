@@ -1,4 +1,4 @@
-# Example configuration only. Enable a theme after configuring accounts.
+# Copy to themes.yaml (ignored by Git). Enable a theme after configuring accounts.
 themes:
   - id: ai
     name: 示例主题

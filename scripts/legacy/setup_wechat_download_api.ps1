@@ -1,12 +1,13 @@
 param(
-    [string]$InstallDir = (Join-Path (Split-Path -Parent $PSScriptRoot) "external\wechat-query-skill"),
+    [string]$InstallDir = (Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) "external\wechat-query-skill"),
     [string]$RepoUrl = "https://github.com/adennng/wechat-query-skill.git",
     [string]$SiteUrl = "http://localhost:5000",
     [string]$DebianMirror = "deb.debian.org",
     [int]$RateLimitGlobal = 120,
     [int]$RateLimitPerIp = 120,
     [int]$RateLimitArticleInterval = 1,
-    [switch]$NoStart
+    [switch]$NoStart,
+    [switch]$Update
 )
 
 $ErrorActionPreference = "Stop"
@@ -24,8 +25,12 @@ Require-Command docker
 if (-not (Test-Path $InstallDir)) {
     New-Item -ItemType Directory -Path (Split-Path -Parent $InstallDir) -Force | Out-Null
     git clone --depth 1 $RepoUrl $InstallDir
+    if ($LASTEXITCODE -ne 0) { throw "Git clone failed." }
 } elseif (Test-Path (Join-Path $InstallDir ".git")) {
-    git -C $InstallDir pull --ff-only
+    if ($Update) {
+        git -C $InstallDir pull --ff-only
+        if ($LASTEXITCODE -ne 0) { throw "Git update failed." }
+    }
 } else {
     throw "InstallDir exists but is not a git checkout: $InstallDir"
 }
@@ -67,11 +72,14 @@ if ($EnvText -match "(?m)^RATE_LIMIT_ARTICLE_INTERVAL=") {
 Set-Content -Path $EnvPath -Value $EnvText -Encoding utf8
 
 if (-not $NoStart) {
-    Push-Location $ServiceDir
+    $PreviousServiceDir = $env:WDA_SERVICE_DIR
+    $env:WDA_SERVICE_DIR = $ServiceDir
     try {
-        docker compose up -d --build
+        $ComposeFile = Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) "config\wechat-service.compose.yaml"
+        docker compose --env-file $EnvPath -f $ComposeFile up -d --build
+        if ($LASTEXITCODE -ne 0) { throw "Docker build/start failed. Start Docker Desktop and inspect the error above." }
     } finally {
-        Pop-Location
+        $env:WDA_SERVICE_DIR = $PreviousServiceDir
     }
 }
 

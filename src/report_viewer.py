@@ -5,7 +5,10 @@ import ipaddress
 import json
 import logging
 import re
+import threading
+import time
 from dataclasses import dataclass
+from functools import lru_cache
 from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -16,7 +19,8 @@ from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 from .config import load_themes, resolve_project_path
-from .html_utils import normalize_image_url
+from .html_utils import full_size_image_url, normalize_image_url
+from .report_images import add_image_viewer
 
 
 LEGACY_THEME_ID = "__legacy__"
@@ -71,7 +75,7 @@ class ReportEntry:
 def serve_report_viewer(project_root: Path, settings: dict[str, Any], host: str, port: int) -> int:
     reports_dir = resolve_project_path(project_root, str(settings.get("reports_dir", "reports")))
     handler = make_handler(project_root=project_root, reports_dir=reports_dir)
-    server = ThreadingHTTPServer((host, port), handler)
+    server = BoundedHTTPServer((host, port), handler)
     server.daemon_threads = True
     url = f"http://{host}:{port}"
     logging.info("Serving report viewer at %s", url)
@@ -86,9 +90,46 @@ def serve_report_viewer(project_root: Path, settings: dict[str, Any], host: str,
     return 0
 
 
+class BoundedHTTPServer(ThreadingHTTPServer):
+    """Cap simultaneous handlers so image loads cannot create unlimited threads."""
+    daemon_threads = True
+
+    def __init__(self, *args, max_workers: int = 8, **kwargs):
+        self._slots = threading.BoundedSemaphore(max_workers)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            try:
+                request.settimeout(1)
+                # Drain the small GET request before closing; Winsock may reset
+                # a connection with unread input before the client sees the 503.
+                request.recv(8192)
+                request.sendall(b"HTTP/1.0 503 Service Unavailable\r\nRetry-After: 1\r\nContent-Length: 0\r\n\r\n")
+            except OSError:
+                pass
+            finally:
+                self.shutdown_request(request)
+            return
+        try:
+            request.settimeout(30)
+            super().process_request(request, client_address)
+        except BaseException:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
+
 def make_handler(project_root: Path, reports_dir: Path) -> type[BaseHTTPRequestHandler]:
     project_root = project_root.resolve()
     reports_dir = reports_dir.resolve()
+    index_lock = threading.Lock()
+    index_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
     class ReportViewerHandler(BaseHTTPRequestHandler):
         server_version = "WeChatReportViewer/1.0"
@@ -96,10 +137,23 @@ def make_handler(project_root: Path, reports_dir: Path) -> type[BaseHTTPRequestH
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
             if parsed.path in {"", "/"}:
-                self._send_bytes(HTTPStatus.OK, "text/html; charset=utf-8", PAGE_HTML.encode("utf-8"))
+                self._send_bytes(HTTPStatus.OK, "text/html; charset=utf-8", add_image_viewer(PAGE_HTML).encode("utf-8"))
                 return
             if parsed.path == "/api/reports":
-                payload = build_report_index(project_root, reports_dir)
+                calendar = first_query_value(parse_qs(parsed.query), "mode") == "calendar"
+                key = "calendar" if calendar else "scheduled"
+                directory = reports_dir / "calendar" if calendar and reports_dir.name != "calendar" else reports_dir
+                with index_lock:
+                    expiry, payload = index_cache.get(key, (0, {}))
+                    if time.monotonic() >= expiry:
+                        payload = build_report_index(project_root, directory)
+                        if calendar:
+                            for day in payload["dates"]:
+                                for report in day["reports"]:
+                                    for field in ("html_url", "md_url"):
+                                        if report[field]:
+                                            report[field] += "&mode=calendar"
+                        index_cache[key] = (time.monotonic() + 3, payload)
                 self._send_json(HTTPStatus.OK, payload)
                 return
             if parsed.path == "/api/report":
@@ -126,13 +180,15 @@ def make_handler(project_root: Path, reports_dir: Path) -> type[BaseHTTPRequestH
             if report_format not in {"html", "md"}:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "unsupported_format"})
                 return
-            report_path = resolve_report_path(reports_dir, date_value, theme_id, report_format)
+            calendar = first_query_value(query, "mode") == "calendar"
+            directory = reports_dir / "calendar" if calendar and reports_dir.name != "calendar" else reports_dir
+            report_path = resolve_report_path(directory, date_value, theme_id, report_format)
             if report_path is None:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "report_not_found"})
                 return
             content_type = "text/html; charset=utf-8" if report_format == "html" else "text/plain; charset=utf-8"
             if report_format == "html":
-                body = rewrite_report_html_images(report_path.read_text(encoding="utf-8", errors="replace")).encode("utf-8")
+                body = add_image_viewer(rewrite_report_html_images(report_path.read_text(encoding="utf-8", errors="replace"))).encode("utf-8")
             else:
                 body = report_path.read_bytes()
             self._send_bytes(HTTPStatus.OK, content_type, body)
@@ -173,14 +229,18 @@ def make_handler(project_root: Path, reports_dir: Path) -> type[BaseHTTPRequestH
             body: bytes,
             cache_control: str = "no-store",
         ) -> None:
-            self.send_response(status)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", cache_control)
-            self.send_header("X-Content-Type-Options", "nosniff")
-            self.end_headers()
-            if body:
-                self.wfile.write(body)
+            try:
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", cache_control)
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                if body:
+                    self.wfile.write(body)
+            except (ConnectionError, TimeoutError):
+                logging.debug("Report viewer client disconnected before response completed")
+
 
     return ReportViewerHandler
 
@@ -201,7 +261,9 @@ def rewrite_report_html_images(html_text: str) -> str:
         if not image_url:
             return match.group(0)
         proxied_src = "/api/image?" + urlencode({"url": image_url})
-        return f"{prefix}{quote}{html.escape(proxied_src, quote=True)}{quote}{ensure_image_attrs(suffix)}"
+        full_src = "/api/image?" + urlencode({"url": full_size_image_url(image_url)})
+        full_attr = f' data-full-src="{html.escape(full_src, quote=True)}"'
+        return f"{prefix}{quote}{html.escape(proxied_src, quote=True)}{quote}{full_attr}{ensure_image_attrs(suffix)}"
 
     return IMG_SRC_RE.sub(replace_src, html_text)
 
@@ -389,15 +451,26 @@ def read_article_count(html_path: Path, md_path: Path | None) -> int | None:
         if path is None:
             continue
         try:
-            match = ARTICLE_COUNT_RE.search(path.read_text(encoding="utf-8", errors="ignore"))
+            stat = path.stat()
+            count = _cached_article_count(path, stat.st_mtime_ns, stat.st_size)
         except OSError:
             continue
-        if match:
-            return int(match.group(1))
+        if count is not None:
+            return count
     return None
 
 
+@lru_cache(maxsize=2048)
+def _cached_article_count(path: Path, mtime_ns: int, size: int) -> int | None:
+    # Our report count appears in the header; never load every historical body.
+    with path.open("r", encoding="utf-8", errors="ignore") as handle:
+        match = ARTICLE_COUNT_RE.search(handle.read(65536))
+    return int(match.group(1)) if match else None
+
+
 def resolve_report_path(reports_dir: Path, date_value: str, theme_id: str, report_format: str) -> Path | None:
+    if report_format not in {"html", "md"}:
+        return None
     if not DATE_RE.match(date_value):
         return None
     if theme_id != LEGACY_THEME_ID and not SAFE_THEME_RE.match(theme_id):
@@ -765,6 +838,7 @@ iframe {
     <section class="brand">
       <div class="brand-kicker">Local Archive</div>
       <h1>微信公众号日报档案台</h1>
+      <p><a href="/?mode=calendar">自然日报告</a> · <a href="/?mode=scheduled">定时日报告</a></p>
       <div class="brand-stat" id="archiveStat">正在读取报告</div>
     </section>
     <nav class="date-list" id="dateList" aria-label="报告日期"></nav>
@@ -811,7 +885,8 @@ init();
 
 async function init() {
   try {
-    const response = await fetch("/api/reports", { cache: "no-store" });
+    const mode = new URLSearchParams(location.search).get("mode") || "calendar";
+    const response = await fetch("/api/reports?mode=" + encodeURIComponent(mode), { cache: "no-store" });
     if (!response.ok) throw new Error("manifest");
     state.manifest = await response.json();
     const firstDate = state.manifest.dates[0];

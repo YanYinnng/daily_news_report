@@ -6,7 +6,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
-from .html_utils import normalize_image_url
+from .html_utils import full_size_image_url, normalize_image_url
 from .models import ArticleDigest, RunIssue
 
 
@@ -18,9 +18,20 @@ REPORT_CSS = (
     ".summary-card{background:#f9fafb;border:1px solid #e5e7eb;border-radius:6px;padding:12px;margin:8px 0 18px}"
     ".summary-card p{margin:0 0 10px}.summary-card p:last-child{margin-bottom:0}.summary-card ul{margin:8px 0 0 20px;padding:0}.summary-card li{margin:6px 0}.summary-card strong{color:#111827;font-weight:700}"
     ".account-overview{background:#f8fafc;border-left:3px solid #94a3b8;padding:10px 12px;margin:8px 0 16px}"
-    ".article-images{display:flex;gap:10px;flex-wrap:wrap;margin:10px 0 18px}.article-images img{max-width:260px;max-height:180px;border-radius:6px;border:1px solid #e5e7eb;object-fit:cover}"
+    ".article-images{display:flex;gap:10px;flex-wrap:wrap;margin:10px 0 18px}.article-images img{max-width:260px;max-height:180px;border-radius:6px;border:1px solid #e5e7eb;object-fit:contain;cursor:zoom-in}.article-images a:focus-visible{outline:3px solid #2563eb;outline-offset:3px}"
     ".issue{color:#991b1b}"
 )
+
+
+def report_notice(issues: list[RunIssue]) -> str:
+    notices = []
+    if any(issue.scope in {"source", "list_posts", "article"} for issue in issues):
+        notices.append("部分采集渠道失败，本期可能漏文；未收录不能视为公众号未更新。")
+    if any(issue.scope in {"summary", "summary_batch", "overview"} for issue in issues):
+        notices.append("部分摘要使用本地兜底，尚未完成模型分析。")
+    if any(issue.scope == "ocr" for issue in issues):
+        notices.append("部分正文来自图片文字识别，关键数字、姓名和网址需核对原图。")
+    return "".join(notices) + ("详见文末“采集或处理异常”。" if notices else "")
 
 
 def build_markdown(
@@ -41,6 +52,7 @@ def build_markdown(
         f"- 汇总窗口：{since.strftime('%Y-%m-%d %H:%M')} 至 {until.strftime('%Y-%m-%d %H:%M')}",
         f"- 新文章数：{len(digests)}",
         "",
+        *([f"> {report_notice(issues)}", ""] if report_notice(issues) else []),
         "## 总览",
         "",
         overview.strip() or "过去 24 小时内没有发现新的文章。",
@@ -49,7 +61,7 @@ def build_markdown(
 
     grouped = group_digests_by_account(digests)
     if grouped:
-        remaining_images = int(settings.get("max_total_images_per_theme", 20) or 0)
+        image_plan = report_image_plan(digests, settings)
         lines.extend(["## 各公众号概览", ""])
         for account_name, items in grouped:
             titles = "；".join(item.meta.title for item in items[:3])
@@ -80,13 +92,12 @@ def build_markdown(
                         "",
                     ]
                 )
-                image_urls = article_image_urls(digest, settings, remaining_images)
+                image_urls = image_plan.get(id(digest), [])
                 if image_urls:
                     lines.append("图片：")
                     for image_url in image_urls:
                         lines.append(f"![]({image_url})")
                     lines.append("")
-                    remaining_images -= len(image_urls)
                 article_index += 1
     else:
         lines.extend(["## 按公众号摘要", "", "过去 24 小时内没有发现新的文章。", ""])
@@ -163,13 +174,14 @@ def build_html(
         f"<h1>{display_title} - {schedule_date.isoformat()}</h1>",
         *([f"<p class='meta'>主题：{html.escape(theme_name)}</p>"] if theme_name else []),
         f"<p class='meta'>汇总窗口：{html.escape(since.strftime('%Y-%m-%d %H:%M'))} 至 {html.escape(until.strftime('%Y-%m-%d %H:%M'))}；新文章数：{len(digests)}</p>",
+        *([f"<p class='issue'>{html.escape(report_notice(issues))}</p>"] if report_notice(issues) else []),
         "<h2>总览</h2>",
         f"<p>{_paragraphs(overview.strip() or '过去 24 小时内没有发现新的文章。')}</p>",
     ]
 
     grouped = group_digests_by_account(digests)
     if grouped:
-        remaining_images = int(settings.get("max_total_images_per_theme", 20) or 0)
+        image_plan = report_image_plan(digests, settings)
         body.append("<h2>各公众号概览</h2><ul>")
         for account_name, items in grouped:
             titles = "；".join(item.meta.title for item in items[:3])
@@ -196,15 +208,9 @@ def build_html(
                         summary_to_html(digest.summary.strip()),
                     ]
                 )
-                image_urls = article_image_urls(digest, settings, remaining_images)
+                image_urls = image_plan.get(id(digest), [])
                 if image_urls:
-                    body.append("<div class='article-images'>")
-                    for image_url in image_urls:
-                        body.append(
-                            f"<img src='{html.escape(image_url, quote=True)}' alt='article image' loading='lazy' decoding='async' referrerpolicy='no-referrer'>"
-                        )
-                    body.append("</div>")
-                    remaining_images -= len(image_urls)
+                    body.append(article_images_to_html(digest, image_urls))
                 article_index += 1
     else:
         body.append("<h2>按公众号摘要</h2>")
@@ -220,6 +226,20 @@ def build_html(
 
     body.extend(["</main></body>", "</html>"])
     return "\n".join(body)
+
+
+def article_images_to_html(digest: ArticleDigest, image_urls: list[str]) -> str:
+    if not image_urls:
+        return ""
+    parts = ["<div class='article-images'>"]
+    for image_number, image_url in enumerate(image_urls, 1):
+        image_alt = html.escape(f"{digest.meta.title} · 图片{image_number}", quote=True)
+        full_url = html.escape(full_size_image_url(image_url), quote=True)
+        parts.append(
+            f"<a href='{full_url}' target='_blank' rel='noopener noreferrer' title='点击查看大图'>"
+            f"<img src='{html.escape(image_url, quote=True)}' alt='{image_alt}' loading='lazy' decoding='async' referrerpolicy='no-referrer'></a>"
+        )
+    return "\n".join([*parts, "</div>"])
 
 
 def write_reports(
@@ -238,8 +258,9 @@ def write_reports(
     else:
         markdown_path = reports_dir / f"{schedule_date.isoformat()}.md"
         html_path = reports_dir / f"{schedule_date.isoformat()}.html"
-    markdown_path.write_text(markdown, encoding="utf-8")
-    html_path.write_text(html_text, encoding="utf-8")
+    from .file_utils import atomic_write_text
+    atomic_write_text(markdown_path, markdown)
+    atomic_write_text(html_path, html_text)
     return markdown_path, html_path
 
 
@@ -300,16 +321,37 @@ def article_image_urls(digest: ArticleDigest, settings: dict[str, Any], remainin
     include_images = str(settings.get("include_images", "auto")).lower()
     if include_images in {"false", "no", "off", "0"} or remaining <= 0:
         return []
-    limit = max(0, int(settings.get("max_images_per_article", 2) or 0))
+    limit = max(0, int(settings.get("max_images_per_article", 3) or 0))
     if limit <= 0:
         return []
     urls: list[str] = []
+    candidates = {row["url"]: row for row in digest.content.image_selection.get("candidates", [])}
     for raw_url in digest.content.image_urls:
         url = normalize_image_url(raw_url)
         if not url.startswith(("http://", "https://")):
             continue
         if url not in urls:
-            urls.append(url)
-        if len(urls) >= min(limit, remaining):
-            break
-    return urls
+            if not candidates or candidates.get(url, {}).get("keep", False):
+                urls.append(url)
+    urls.sort(key=lambda url: -float(candidates.get(url, {}).get("score", 0)))
+    return urls[:min(limit, remaining)]
+
+
+def report_image_plan(digests: list[ArticleDigest], settings: dict[str, Any]) -> dict[int, list[str]]:
+    """Apply size caps after quality ranking across the whole theme, not file order."""
+    total_limit = max(0, int(settings.get("max_total_images_per_theme", 30) or 0))
+    ranked = []
+    metadata = {}
+    for article_index, digest in enumerate(digests):
+        rows = {row["url"]: row for row in digest.content.image_selection.get("candidates", [])}
+        metadata[id(digest)] = rows
+        for image_index, url in enumerate(article_image_urls(digest, settings, total_limit)):
+            info = rows.get(url, {})
+            ranked.append((-float(info.get("score", 0)), article_index, image_index, id(digest), url))
+    plan: dict[int, list[str]] = {}
+    for _, _, _, key, url in sorted(ranked)[:total_limit]:
+        plan.setdefault(key, []).append(url)
+    for key, urls in plan.items():
+        original_order = {url: index for index, url in enumerate(urls)}
+        urls.sort(key=lambda url: metadata[key].get(url, {}).get("position", original_order[url]))
+    return plan

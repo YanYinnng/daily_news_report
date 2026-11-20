@@ -8,6 +8,8 @@ from xml.etree import ElementTree
 
 import requests
 
+from .cache import ContentCache
+
 from ..html_utils import clean_text, extract_image_urls, html_to_text
 from ..models import Account, ArticleContent, ArticleMeta
 from ..timeutils import parse_datetime_value
@@ -17,7 +19,7 @@ class RssSource:
     def __init__(self, timeout_seconds: int = 60, timezone_name: str = "Asia/Shanghai") -> None:
         self.timeout_seconds = timeout_seconds
         self.timezone_name = timezone_name
-        self._content_cache: dict[str, ArticleContent] = {}
+        self._content_cache = ContentCache()
 
     def supports_account(self, account: Account) -> bool:
         return bool(account.rss_url)
@@ -31,7 +33,7 @@ class RssSource:
 
     def list_recent_posts(self, account: Account, limit: int = 10) -> list[ArticleMeta]:
         metas = self._fetch_items(account)
-        metas.sort(key=lambda item: item.published_at or datetime.min, reverse=True)
+        metas.sort(key=lambda item: item.published_at.timestamp() if item.published_at else float("-inf"), reverse=True)
         return metas[:limit]
 
     def fetch_article(self, article_url: str) -> ArticleContent:

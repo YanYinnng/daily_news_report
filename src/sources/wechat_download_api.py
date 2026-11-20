@@ -9,10 +9,13 @@ from typing import Any
 
 import requests
 
+from .cache import ContentCache
+
 from ..html_utils import clean_text, extract_image_urls, html_to_text
+from ..file_utils import atomic_write_text
 from ..models import Account, ArticleContent, ArticleMeta
 from ..timeutils import parse_datetime_value
-from .base import SourceError
+from .base import SourceError, SourceRateLimited
 
 
 class WechatDownloadApiSource:
@@ -30,6 +33,10 @@ class WechatDownloadApiSource:
         article_fetch_interval_seconds: float = 3.0,
         freq_control_sleep_seconds: float = 75.0,
         freq_control_retries: int = 1,
+        failure_cooldown_seconds: float = 300.0,
+        rate_limit_cooldown_seconds: float = 1800.0,
+        health_path: Path | None = None,
+        article_list_enabled: bool = True,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
@@ -39,13 +46,31 @@ class WechatDownloadApiSource:
         self.max_pages = max(1, max_pages)
         self.account_cache_path = account_cache_path
         self.fetch_full_content = fetch_full_content
+        self.article_list_enabled = article_list_enabled
         self.request_interval_seconds = max(0.0, request_interval_seconds)
         self.article_fetch_interval_seconds = max(self.request_interval_seconds, article_fetch_interval_seconds)
         self.freq_control_sleep_seconds = max(1.0, freq_control_sleep_seconds)
         self.freq_control_retries = max(0, freq_control_retries)
         self.session = requests.Session()
+        # A local service must not go through a stale system HTTP proxy.
+        from urllib.parse import urlparse
+        if urlparse(self.base_url).hostname in {"localhost", "127.0.0.1", "::1"}:
+            self.session.trust_env = False
+        self.failure_cooldown_seconds = max(0.0, failure_cooldown_seconds)
+        self._unavailable_until = 0.0
+        self.rate_limit_cooldown_seconds = max(60.0, rate_limit_cooldown_seconds)
+        self.health_path = health_path
+        self._rate_limited_until = 0.0
+        self._rate_limited_scope = "all"
+        if health_path and health_path.exists():
+            try:
+                health = json.loads(health_path.read_text(encoding="utf-8"))
+                self._rate_limited_until = float(health.get("blocked_until", 0))
+                self._rate_limited_scope = "article_list" if health.get("scope") == "article_list" else "all"
+            except (OSError, ValueError, TypeError, AttributeError):
+                pass
         self._account_cache = self._load_account_cache()
-        self._content_cache: dict[str, ArticleContent] = {}
+        self._content_cache = ContentCache()
         self._last_request_at = 0.0
         self._last_article_fetch_at = 0.0
 
@@ -56,6 +81,7 @@ class WechatDownloadApiSource:
         return article_url in self._content_cache or "mp.weixin.qq.com/" in article_url
 
     def list_posts(self, account: Account, since: datetime, until: datetime) -> list[ArticleMeta]:
+        self._check_article_list_enabled()
         fakeid, public_name, alias = self._resolve_account(account)
         results: list[ArticleMeta] = []
         seen_urls: set[str] = set()
@@ -79,10 +105,11 @@ class WechatDownloadApiSource:
             if page_times and min(page_times) < since:
                 break
 
-        results.sort(key=lambda item: item.published_at or datetime.min)
+        results.sort(key=lambda item: item.published_at.timestamp() if item.published_at else float("-inf"))
         return results
 
     def list_recent_posts(self, account: Account, limit: int = 10) -> list[ArticleMeta]:
+        self._check_article_list_enabled()
         fakeid, public_name, alias = self._resolve_account(account)
         results: list[ArticleMeta] = []
         seen_urls: set[str] = set()
@@ -102,8 +129,12 @@ class WechatDownloadApiSource:
                 if len(results) >= limit:
                     break
 
-        results.sort(key=lambda item: item.published_at or datetime.min, reverse=True)
+        results.sort(key=lambda item: item.published_at.timestamp() if item.published_at else float("-inf"), reverse=True)
         return results[:limit]
+
+    def _check_article_list_enabled(self) -> None:
+        if not self.article_list_enabled:
+            raise SourceError("微信后台跨公众号列表入口已暂停：上游报告接口能力受限；等待兼容修复，当前只使用其他发现来源。已知文章链接仍可单独读取。")
 
     def fetch_article(self, article_url: str) -> ArticleContent:
         cached = self._content_cache.get(article_url)
@@ -139,7 +170,7 @@ class WechatDownloadApiSource:
             published_at=parse_datetime_value(data.get("publish_time") or data.get("publish_time_str"), self.timezone_name),
             text=text,
             image_urls=image_urls,
-            raw={"source": "wechat-download-api-fetch", **data},
+            raw={"source": "wechat-download-api-fetch", "account_name": data.get("account_name")},
         )
         self._cache_content(article_url, content)
         self._cache_content(content.url, content)
@@ -181,7 +212,7 @@ class WechatDownloadApiSource:
         data = payload.get("data") or {}
         articles = data.get("articles") if isinstance(data, dict) else None
         if not isinstance(articles, list):
-            return []
+            raise SourceError("wechat-download-api returned an invalid article list")
         return [item for item in articles if isinstance(item, dict)]
 
     def _request_api(
@@ -192,6 +223,13 @@ class WechatDownloadApiSource:
         json_body: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         url = f"{self.base_url}{path}"
+        blocked = self._rate_limited_scope == "all" or path.startswith("/api/public/articles")
+        if blocked and time.time() < self._rate_limited_until:
+            remaining = max(1, int(self._rate_limited_until - time.time()))
+            scope = "article-list" if self._rate_limited_scope == "article_list" else "service"
+            raise SourceRateLimited(f"wechat-download-api {scope} requests restricted; local retry protection {remaining}s (not a recovery estimate)")
+        if time.monotonic() < self._unavailable_until:
+            raise SourceError("wechat-download-api temporarily unavailable; waiting for service/login recovery")
         attempts = self.freq_control_retries + 1
         for attempt in range(attempts):
             self._wait_for_request_slot(path)
@@ -201,11 +239,20 @@ class WechatDownloadApiSource:
                     url,
                     params=params,
                     json=json_body,
-                    timeout=self.timeout_seconds,
+                    timeout=(min(5, self.timeout_seconds), self.timeout_seconds),
                     headers={"User-Agent": "WeChatDailyDigest/1.0"},
                 )
                 response.raise_for_status()
             except requests.RequestException as exc:
+                if getattr(exc.response, "status_code", None) == 429:
+                    self._mark_rate_limited("HTTP 429")
+                    raise SourceRateLimited("wechat-download-api HTTP 429; shared cooldown started") from exc
+                if isinstance(exc, requests.ConnectionError):
+                    self._unavailable_until = time.monotonic() + self.failure_cooldown_seconds
+                    raise SourceError("wechat-download-api connection failed; check Docker and port 5000") from exc
+                if getattr(exc.response, "status_code", None) in {401, 403}:
+                    self._unavailable_until = time.monotonic() + self.failure_cooldown_seconds
+                    raise SourceError("wechat-download-api login required; open /login.html") from exc
                 if attempt < attempts - 1:
                     time.sleep(min(self.freq_control_sleep_seconds, 10.0))
                     continue
@@ -220,18 +267,34 @@ class WechatDownloadApiSource:
                 raise SourceError(f"wechat-download-api returned invalid response from {path}")
             if payload.get("success") is False:
                 error = str(payload.get("error") or f"wechat-download-api call failed: {path}")
-                if self._is_freq_control_error(error) and attempt < attempts - 1:
-                    time.sleep(self.freq_control_sleep_seconds)
-                    continue
+                if any(marker in error.lower() for marker in ("登录", "login", "session expired", "200003")):
+                    self._unavailable_until = time.monotonic() + self.failure_cooldown_seconds
+                if self._is_freq_control_error(error):
+                    self._mark_rate_limited(error, path=path)
+                    raise SourceRateLimited(error + "; shared cooldown started, account-by-account retries stopped")
                 raise SourceError(error)
             return payload
         raise SourceError(f"wechat-download-api call failed after retries: {path}")
 
+    def _mark_rate_limited(self, reason: str, path: str = "") -> None:
+        self._rate_limited_until = time.time() + self.rate_limit_cooldown_seconds
+        # The cross-account index and public article reader are separate
+        # capabilities. An index denial must not disable known-URL reading.
+        # HTTP 429 and unknown legacy failures remain service-wide.
+        self._rate_limited_scope = "article_list" if path.startswith("/api/public/articles") else "all"
+        if self.health_path:
+            atomic_write_text(self.health_path, json.dumps({
+                "status": "rate_limited", "checked_at": datetime.now().astimezone().isoformat(),
+                "blocked_until": self._rate_limited_until, "reason": reason,
+                "scope": self._rate_limited_scope,
+            }, ensure_ascii=False, indent=2))
+
     def _wait_for_request_slot(self, path: str) -> None:
         now = time.monotonic()
-        min_interval = self.article_fetch_interval_seconds if path.startswith("/api/article") else self.request_interval_seconds
-        last_request_at = self._last_article_fetch_at if path.startswith("/api/article") else self._last_request_at
-        wait_seconds = min_interval - (now - last_request_at)
+        next_request = self._last_request_at + self.request_interval_seconds
+        if path.startswith("/api/article"):
+            next_request = max(next_request, self._last_article_fetch_at + self.article_fetch_interval_seconds)
+        wait_seconds = next_request - now
         if wait_seconds > 0:
             time.sleep(wait_seconds)
         timestamp = time.monotonic()
@@ -301,11 +364,14 @@ class WechatDownloadApiSource:
             for value in (account.wxid, account.opencli_query)
             if value
         }
+        # Prefer the configured WeChat ID across the whole result set; a
+        # same-name account earlier in search results must not win.
         for item in items:
-            nickname = self._normalize_account_name(str(item.get("nickname") or ""))
             alias = self._normalize_account_name(str(item.get("alias") or ""))
             if alias and alias in expected_aliases:
                 return item
+        for item in items:
+            nickname = self._normalize_account_name(str(item.get("nickname") or ""))
             if nickname and nickname in expected_names:
                 return item
         return None
@@ -338,7 +404,7 @@ class WechatDownloadApiSource:
             return
         self.account_cache_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {"accounts": self._account_cache}
-        self.account_cache_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        atomic_write_text(self.account_cache_path, json.dumps(payload, ensure_ascii=False, indent=2))
 
     def _account_cache_key(self, account: Account) -> str:
         return account.wxid or self._normalize_account_name(account.name)

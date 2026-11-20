@@ -26,6 +26,11 @@ def scheduled_window(schedule_date: date, run_time: time, lookback_hours: int, t
     return since, until
 
 
+def calendar_window(day: date, timezone_name: str) -> tuple[datetime, datetime]:
+    tz = ZoneInfo(timezone_name)
+    return datetime.combine(day, time.min, tzinfo=tz), datetime.combine(day + timedelta(days=1), time.min, tzinfo=tz)
+
+
 def parse_datetime_value(value: object, timezone_name: str) -> datetime | None:
     if value is None:
         return None

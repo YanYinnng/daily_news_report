@@ -1,0 +1,4 @@
+# Local QR image generation for the default WeRead route (included by requirements.txt).
+qrcode==8.2
+pypng==0.20220715.0
+colorama==0.4.6

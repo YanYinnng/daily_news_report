@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import time
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 
@@ -14,6 +16,10 @@ from .models import ArticleContent, ArticleMeta
 
 _DANGLING_LABEL_RE = re.compile(r"^-?\s*\*\*[^*\n]{2,80}\*\*\s*[:\uFF1A]\s*$")
 _DANGLING_PLAIN_LABEL_RE = re.compile(r"^(一句话结论|结论|要点|核心要点|分条摘要)\s*[:\uFF1A]\s*$")
+
+
+class SummaryTruncatedError(RuntimeError):
+    pass
 
 
 class Summarizer:
@@ -27,6 +33,9 @@ class Summarizer:
         self.batch_article_chars = int(settings.get("llm_batch_article_chars", 2500))
         self.temperature = float(settings.get("llm_temperature", 0.2))
         self.max_tokens = int(settings.get("llm_max_tokens", 1200))
+        self.thinking = str(settings.get("llm_thinking", "default")).lower()
+        self.truncation_retries = max(0, min(2, int(settings.get("llm_truncation_retries", 1))))
+        self.truncation_max_tokens = max(self.max_tokens, int(settings.get("llm_truncation_max_tokens", 8000)))
         if not self.base_url or not self.api_key or not self.model:
             raise ConfigError("Missing LLM_BASE_URL, LLM_API_KEY, or LLM_MODEL in .env")
 
@@ -94,6 +103,7 @@ class Summarizer:
 要求：
 - 先写一句话结论。
 - 再列出 3-5 个要点。
+- 总长度控制在 700 个中文字符以内；资讯合集选择最重要的 3-5 组，不逐条复述全部内容。
 - 保留关键人物、公司、产品、数字、时间。
 - 不要编造原文没有的信息。
 - {style_instruction}
@@ -137,10 +147,26 @@ class Summarizer:
         )
 
     def _chat(self, messages: list[dict[str, str]]) -> str:
+        budget = self.max_tokens
+        for attempt in range(self.truncation_retries + 1):
+            try:
+                return self._chat_once(messages, budget)
+            except SummaryTruncatedError:
+                expanded = min(budget * 2, self.truncation_max_tokens)
+                if attempt == self.truncation_retries or expanded <= budget:
+                    raise
+                logging.warning("LLM output truncated at %d tokens; retrying once with %d", budget, expanded)
+                budget = expanded
+        raise RuntimeError("LLM summary retries exhausted")
+
+    def _chat_once(self, messages: list[dict[str, str]], max_tokens: int) -> str:
         endpoint = self.base_url
         if not endpoint.endswith("/chat/completions"):
             endpoint = endpoint + "/chat/completions"
         last_error: Exception | None = None
+        request_body = {"model": self.model, "messages": messages, "temperature": self.temperature, "max_tokens": max_tokens}
+        if urlparse(self.base_url).hostname == "api.deepseek.com" and self.thinking in {"enabled", "disabled"}:
+            request_body["thinking"] = {"type": self.thinking}
         for attempt in range(self.retries + 1):
             try:
                 response = requests.post(
@@ -149,12 +175,7 @@ class Summarizer:
                         "Authorization": f"Bearer {self.api_key}",
                         "Content-Type": "application/json",
                     },
-                    json={
-                        "model": self.model,
-                        "messages": messages,
-                        "temperature": self.temperature,
-                        "max_tokens": self.max_tokens,
-                    },
+                    json=request_body,
                     timeout=self.timeout_seconds,
                 )
                 if response.status_code in {429, 500, 502, 503, 504} and attempt < self.retries:
@@ -173,11 +194,15 @@ class Summarizer:
         try:
             choice = payload["choices"][0]
             finish_reason = choice.get("finish_reason")
-            content = choice["message"]["content"].strip()
+            content = (choice["message"].get("content") or "").strip()
         except (KeyError, IndexError, TypeError) as exc:
-            raise RuntimeError(f"Unexpected LLM response shape: {payload}") from exc
+            raise RuntimeError("Unexpected LLM response shape (response body omitted)") from exc
+        usage = payload.get("usage") or {}
+        details = usage.get("completion_tokens_details") or {}
+        logging.info("LLM completed model=%s finish=%s output_tokens=%s reasoning_tokens=%s",
+                     self.model, finish_reason, usage.get("completion_tokens"), details.get("reasoning_tokens"))
         if finish_reason == "length":
-            raise RuntimeError(f"LLM response was truncated by max_tokens={self.max_tokens}")
+            raise SummaryTruncatedError(f"LLM response was truncated by max_tokens={max_tokens}")
         if finish_reason and finish_reason not in {"stop", "length"}:
             raise RuntimeError(f"LLM response ended unexpectedly: finish_reason={finish_reason}")
         if not content:
@@ -240,6 +265,6 @@ class Summarizer:
         if profile == "list_digest":
             return (
                 "如果原文是资讯列表、通知合集、活动/招聘清单、链接汇编或日报/周报型内容，"
-                "请按原条目分组概括，保留每条信息的对象、时间、地点、动作和链接线索；不要把所有条目压缩成一个笼统结论。"
+                "请选择最重要的 3-5 组条目概括，保留选中信息的对象、时间、地点、动作和链接线索；不要只给一个笼统结论。"
             )
         return "如果原文是普通长文或评论文章，请按核心观点、关键事实和影响总结。"

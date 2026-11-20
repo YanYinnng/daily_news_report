@@ -7,6 +7,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from .config import PROJECT_ROOT, resolve_project_path
+from .file_utils import atomic_write_text
 
 
 DEFAULT_HEALTH_PATH = "data/source_health.json"
@@ -64,7 +65,7 @@ def _read_health(settings: dict[str, Any]) -> dict[str, Any]:
 def _write_health(settings: dict[str, Any], health: dict[str, Any]) -> None:
     path = _health_path(settings)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(health, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_text(path, json.dumps(health, ensure_ascii=False, indent=2))
 
 
 def _health_path(settings: dict[str, Any]) -> Path:

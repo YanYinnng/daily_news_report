@@ -1,0 +1,36 @@
+name: wechat-download-api
+services:
+  wechat-api:
+    build:
+      context: ${WDA_SERVICE_DIR:-../external/wechat-query-skill/services/wechat-download-api}
+      args:
+        DEBIAN_MIRROR: ${DEBIAN_MIRROR:-deb.debian.org}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+        PIP_EXTRA_INDEX_URL: ${PIP_EXTRA_INDEX_URL:-}
+    container_name: wechat-download-api
+    user: "0:0"
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5000:5000"
+    volumes:
+      - ${WDA_SERVICE_DIR:-../external/wechat-query-skill/services/wechat-download-api}/data:/app/data
+      - ${WDA_SERVICE_DIR:-../external/wechat-query-skill/services/wechat-download-api}/.env:/app/.env
+    environment:
+      TZ: Asia/Shanghai
+      PYTHONUNBUFFERED: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    # Initial guardrails, adjustable after observing a full production run.
+    mem_limit: 1g
+    cpus: 1.5
+    pids_limit: 256
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:5000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s

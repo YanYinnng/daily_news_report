@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import sqlite3
-import time
 from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
@@ -10,20 +9,57 @@ from typing import Iterator
 
 
 class StateStore:
-    def __init__(self, db_path: Path) -> None:
+    def __init__(self, db_path: Path, read_only: bool = False) -> None:
         self.db_path = db_path
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._init_db()
+        self.read_only = read_only
+        if not read_only:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            self._init_db()
 
     def is_complete(self, schedule_date: date, require_email: bool = False, theme_id: str = "default") -> bool:
         with self._connect() as conn:
             row = conn.execute(
-                "select status, email_sent_at from theme_reports where schedule_date = ? and theme_id = ?",
+                "select status, email_sent_at, email_required, markdown_path, html_path from theme_reports where schedule_date = ? and theme_id = ?",
                 (schedule_date.isoformat(), theme_id),
             ).fetchone()
         if not row or row[0] != "success":
             return False
-        return bool(row[1]) if require_email else True
+        if not all(value and Path(value).is_file() for value in row[3:5]):
+            return False
+        return (bool(row[1]) or not row[2]) if require_email else True
+
+    def get_generated_report(self, schedule_date: date, theme_id: str) -> tuple[Path, Path, bool] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "select markdown_path, html_path, email_required from theme_reports "
+                "where schedule_date=? and theme_id=? and status in ('generated', 'success')",
+                (schedule_date.isoformat(), theme_id),
+            ).fetchone()
+        if not row or not all(value and Path(value).is_file() for value in row[:2]):
+            return None
+        return Path(row[0]), Path(row[1]), bool(row[2])
+
+    def mark_generated(self, schedule_date: date, markdown_path: Path, html_path: Path,
+                       theme_id: str, email_required: bool = True) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """insert into theme_reports
+                   (schedule_date, theme_id, status, generated_at, markdown_path, html_path, email_required)
+                   values (?, ?, 'generated', ?, ?, ?, ?)
+                   on conflict(schedule_date, theme_id) do update set
+                   status='generated', generated_at=excluded.generated_at,
+                   markdown_path=excluded.markdown_path, html_path=excluded.html_path,
+                   email_required=excluded.email_required, email_sent_at=null, error_message=null""",
+                (schedule_date.isoformat(), theme_id, datetime.now().isoformat(timespec="seconds"),
+                 str(markdown_path), str(html_path), int(email_required)),
+            )
+
+    def mark_delivery_failed(self, schedule_date: date, theme_id: str, message: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "update theme_reports set status='generated', error_message=? where schedule_date=? and theme_id=?",
+                (message[:2000], schedule_date.isoformat(), theme_id),
+            )
 
     def mark_started(self, schedule_date: date, theme_id: str = "default") -> None:
         now = datetime.now().isoformat(timespec="seconds")
@@ -114,6 +150,7 @@ class StateStore:
 
     def _init_db(self) -> None:
         with self._connect() as conn:
+            conn.execute("begin immediate")
             conn.execute(
                 """
                 create table if not exists reports(
@@ -152,10 +189,14 @@ class StateStore:
                 )
                 """
             )
+            columns = {row[1] for row in conn.execute("pragma table_info(theme_reports)")}
+            if "email_required" not in columns:
+                conn.execute("alter table theme_reports add column email_required integer not null default 1")
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        conn = sqlite3.connect(self.db_path)
+        conn = (sqlite3.connect(self.db_path.resolve().as_uri() + "?mode=ro", uri=True) if self.read_only
+                else sqlite3.connect(self.db_path, timeout=30))
         try:
             yield conn
             conn.commit()
@@ -163,19 +204,45 @@ class StateStore:
             conn.close()
 
 
+class RunAlreadyActive(FileExistsError):
+    pass
+
+
 @contextmanager
-def run_lock(lock_path: Path, stale_seconds: int = 7200) -> Iterator[None]:
+def run_lock(lock_path: Path) -> Iterator[None]:
+    """OS lock: released on process exit, never stolen based on file age.
+
+    The small marker file stays on disk; its existence does not mean a run is active.
+    Keeping one inode also prevents concurrent waiters locking different files.
+    """
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    if lock_path.exists():
-        age = time.time() - lock_path.stat().st_mtime
-        if age > stale_seconds:
-            lock_path.unlink(missing_ok=True)
-    fd: int | None = None
+    handle = lock_path.open("a+b")
+    locked = False
     try:
-        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.write(fd, str(os.getpid()).encode("ascii"))
+        if handle.seek(0, os.SEEK_END) == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise RunAlreadyActive(f"Another digest run holds {lock_path}") from exc
+        locked = True
+        # The marker is deliberately opaque. Rewriting/truncating it while
+        # locked creates an initialization race for new Windows contenders.
         yield
     finally:
-        if fd is not None:
-            os.close(fd)
-        lock_path.unlink(missing_ok=True)
+        if locked:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()

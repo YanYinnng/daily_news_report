@@ -1,0 +1,4 @@
+interface:
+  display_name: "微信公众号搜索与读取"
+  short_description: "搜索微信公众号推文、读取文章正文，并处理微信读书登录和授权"
+  default_prompt: "用 $wechat-public-articles 找到相关文章，核对标题和日期，并读取可访问的正文。"
